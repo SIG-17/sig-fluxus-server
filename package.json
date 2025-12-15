@@ -1,0 +1,14 @@
+{
+  "name": "vectura-pubsub",
+  "version": "1.0.3",
+  "description": "A WebSocket-based publish/subscribe system that facilitates communication, file transfer, and reconnections with advanced handling features.",
+  "main": "js/VecturaPubSub.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SIG-17/sig-ws-server.git"
+  },
+  "private": true
+}

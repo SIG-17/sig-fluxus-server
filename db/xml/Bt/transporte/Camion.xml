@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    * Creado por el Dpto. de Sistemas Papelera Tucumán - Grupo Telecentro.
+    * Parte de SIG-Library
+    * <| List.xml |>
+    * Author: marpan
+    * Date: 06/06/13
+    * Time: 15:07
+        /* The query types. */
+        const SELECT = 0;
+        const DELETE = 1;
+        const UPDATE = 2;
+        const SP = 3;
+        const SP_WITH_RESULTS = 4;
+
+    * sqlexpression-> se usan los métodos de la clase Expression del QueryBuilder.
+
+    SELECT c.ID_Camion idCamion, c.MarcaTr, c.ModeloTr, c.PatTractor, c.TaraT taraT, c.MarcaAc, c.ModeloAc, c.PatAco c.TaraA taraA, e.RazonSocial, c.ID_Emptrans idEmpTrans, e.Cuit FROM SIG.dbo.Bt_Camiones c INNER JOIN SIG.dbo.BT_EmpTrans e ON c.ID_Emptrans=e.ID_Emptrans"
+-->
+<statements>
+    <statement server="sql">
+        <type>select</type>
+        <metadata>
+            <connection>sqlsj</connection>
+            <operation>select</operation>
+            <allowed>*</allowed>
+            <version>1.2</version>
+        </metadata>
+        <from>
+            <table>Sig</table>
+            <table>dbo</table>
+            <table>Bt_Camiones</table>
+            <alias>c</alias>
+            <quote>1</quote>
+            <columns>
+                <column>
+                    <name>ID_Camion</name>
+                    <alias>id</alias>
+                    <type>int</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>ID_Camion</name>
+                    <alias>idCamion</alias>
+                    <type>int</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>MarcaTr</name>
+                    <alias>marcaTr</alias>
+                    <type>string</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>ModeloTr</name>
+                    <alias>modeloTr</alias>
+                    <type>int</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>PatTractor</name>
+                    <alias>patTractor</alias>
+                    <type>string</type>
+                    <visible>1</visible>
+                    <conditions>
+                        <condition>
+                            <name>patTractor</name>
+                            <paramTemplate>UPPER(Replace(c.PatTractor, ' ', '')) LIKE UPPER(Replace(:param, ' ', ''))</paramTemplate>
+                        </condition>
+                    </conditions>
+                </column>
+                <column>
+                    <name>TaraT</name>
+                    <alias>taraT</alias>
+                    <type>int</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>MarcaAc</name>
+                    <alias>marcaAc</alias>
+                    <type>string</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>ModeloAc</name>
+                    <alias>modeloAc</alias>
+                    <type>int</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>PatAcoplado</name>
+                    <alias>patAcoplado</alias>
+                    <type>string</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>TaraA</name>
+                    <alias>taraA</alias>
+                    <type>int</type>
+                    <visible>1</visible>
+                </column>
+                <column>
+                    <name>ID_Emptrans</name>
+                    <alias>idEmpTrans</alias>
+                    <type>int</type>
+                    <visible>1</visible>
+                </column>
+            </columns>
+        </from>
+        <joins>
+            <join>
+                <type>inner</type>
+                <table>Sig</table>
+                <table>dbo</table>
+                <table>BT_EmpTrans</table>
+                <quote>1</quote>
+                <alias>e</alias>
+                <columns>
+                    <column>
+                        <name>ID_Emptrans</name>
+                        <alias>idEmptrans</alias>
+                        <type>int</type>
+                        <joinConditions>
+                            <joinCondition>
+                                <tableAlias>c</tableAlias>
+                                <columnName>ID_EmpTrans</columnName>
+                            </joinCondition>
+                        </joinConditions>
+                    </column>
+                    <column>
+                        <name>Cuit</name>
+                        <alias>cuit</alias>
+                        <type>string</type>
+                        <visible>1</visible>
+                    </column>
+                    <column>
+                        <name>RazonSocial</name>
+                        <alias>razonSocial</alias>
+                        <type>string</type>
+                        <visible>1</visible>
+                    </column>
+                </columns>
+            </join>
+        </joins>
+    </statement>
+</statements>

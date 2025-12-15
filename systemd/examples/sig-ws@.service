@@ -1,0 +1,48 @@
+# /etc/systemd/system/sig-ws@.service
+[Unit]
+Description=WebSocket Pub/Sub Server - Instancia %I
+Documentation=https://github.com/tu-usuario/tu-repositorio
+After=network.target redis-server.service
+Wants=redis-server.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=sig
+Group=sig
+WorkingDirectory=/var/www/sig-ws
+ExecStart=/usr/bin/php /var/www/sig-ws/app/router.php --ws-config=%I
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sig-ws-%I
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/www/sig-ws/logs
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitMEMLOCK=infinity
+
+# Timeouts
+TimeoutStartSec=30
+TimeoutStopSec=30
+TimeoutSec=30
+
+# Environment
+Environment="PATH=/usr/bin:/bin"
+Environment="PHP_INI_SCAN_DIR=/var/www/sig-ws/conf"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+
+<statements>
+    <statement server="sql">
+        <type>exec</type>
+        <metadata>
+            <connection>sqlsj</connection>
+            <operation>execute</operation>
+            <allowed>*</allowed>
+            <version>1.2</version>
+        </metadata>
+        <namedArguments>1</namedArguments>
+        <argListSurrounded>0</argListSurrounded>
+        <prefixVariable>@</prefixVariable>
+        <procedure>SIG</procedure>
+        <procedure>ora</procedure>
+        <procedure>SYNC_HR_Orgs</procedure>
+    </statement>
+</statements>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<statements>
+    <statement>
+        <type>exec</type>
+        <metadata>
+            <connection>sqlsj</connection>
+            <operation>select</operation>
+            <allowed>*</allowed>
+            <version>1.2</version>
+        </metadata>
+        <namedArguments>1</namedArguments>
+        <argListSurrounded>0</argListSurrounded>
+        <prefixVariable>@</prefixVariable>
+        <procedure>SIG</procedure>
+        <procedure>dbo</procedure>
+        <procedure>PT_L_Parte_Despacho_Expedicion</procedure>
+        <arguments>
+            <argument>
+                <paramName>subinventarios</paramName>
+                <name>subinventarios</name>
+                <required>1</required>
+                <type>string</type>
+            </argument>
+        </arguments>
+    </statement>
+</statements>

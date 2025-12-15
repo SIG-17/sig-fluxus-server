@@ -1,0 +1,48 @@
+{
+  "name": "sig-17/sig-ws-server",
+  "description": "WebSocket Server. Componente parte del SIG",
+  "version": "1.0.0",
+  "type": "library",
+  "authors": [
+    {
+      "name": "Martín Panizzo",
+      "email": "code.tabula17@gmail.com.com"
+    }
+  ],
+  "extra": {
+    "branch-alias": {
+      "dev-main": "1.0.x-dev"
+    }
+  },
+  "repositories": [
+    {
+      "type": "composer",
+      "url": "https://tabula17.repo.repman.io"
+    }
+  ],
+  "minimum-stability": "dev",
+  "autoload": {
+    "psr-4": {
+      "SIG\\Server\\": "src/"
+    }
+  },
+  "require": {
+    "xvii/satelles-utilis-proelio": "@dev",
+    "monolog/monolog": "@dev",
+    "bramus/monolog-colored-line-formatter": "@dev",
+    "php": ">=8.4",
+    "ext-swoole": ">=6.0",
+    "ext-posix": "*",
+    "utopia-php/mongo": "dev-main"
+  },
+  "require-dev": {
+    "swoole/ide-helper": "@dev",
+    "xvii/satelles-omnia-roga": "@dev"
+  },
+  "suggest": {
+    "ext-redis": "For Redis subscription integration",
+    "ext-mongodb": "For MongoDB subscription integration",
+    "ext-pdo": "For Database subscription integration",
+    "xvii/satelles-omnia-roga": "For RPC Database integration"
+  }
+}
