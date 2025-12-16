@@ -2,6 +2,8 @@
 <?php
 declare(strict_types=1);
 
+use SIG\Server\Protocol\Status;
+use Swoole\Atomic;
 use Bramus\Monolog\Formatter\ColoredLineFormatter;
 use Monolog\Formatter\MongoDBFormatter;
 use Monolog\Level;
@@ -12,6 +14,7 @@ use SIG\Server\Collection\MethodsSetCollection;
 use SIG\Server\Config\ChannelConfig;
 use SIG\Server\RPC\DbProcessor;
 use SIG\Server\Fluxus;
+use Swoole\Lock;
 use Swoole\Runtime;
 use Tabula17\Satelles\Omnia\Roga\Database\Connector;
 use Tabula17\Satelles\Omnia\Roga\Database\HealthManager;
@@ -23,6 +26,9 @@ use Tabula17\Satelles\Utilis\Log\Handler\MongoDbHandler;
 
 require __DIR__ . '/../vendor/autoload.php';
 
+// Variables globales para coordinación
+$globalShutdownInitiated = new Atomic(0);
+$shutdownLock = new Lock(SWOOLE_MUTEX);
 /**
  * Argumentos:
  * -v       Modo verbose
@@ -235,6 +241,58 @@ try {
             }
         }
     }
+
+    // Handler RPC para shutdown
+    $server->registerRpcMethod('ws.shutdown', function ($data, $fd, $reactorId, Fluxus $server) use ($logger, $globalShutdownInitiated) {
+        $logger->info("Shutdown solicitado via RPC desde FD $fd");
+        // Solo permitir un shutdown a la vez
+        if ($globalShutdownInitiated->cmpset(0, 1)) {
+            // Marcar shutdown en el server
+            if (property_exists($server, 'isShuttingDown')) {
+                $server->isShuttingDown = true;
+            }
+            // Iniciar shutdown
+            $server->shutdown();
+            return [
+                    'status' => 'success',
+                    'message' => 'Shutdown iniciado',
+                    'timestamp' => time()
+            ];
+        }
+
+        return [
+                'status' => 'already_in_progress',
+                'message' => 'Shutdown ya en progreso'
+        ];
+    });
+    // Handler RPC para shutdown
+    $server->registerRpcMethod('ws.reload', function ($data, $fd, $reactorId, Fluxus $server) use ($logger, $globalShutdownInitiated) {
+        $server->logger->info("Forcing reload from client {$fd}");
+        // Enviar respuesta
+        $response = $server->responseProtocol->getProtocolFor(
+                [
+                        'type' => $server->responseProtocol->get('rpcResponse'),
+                        'id' => $params['id'] ?? '',
+                        'status' => Status::success,
+                        'result' => [
+                                'status' => Status::ok->value ,
+                                'message' => 'Reload executed',
+                                'timestamp' => time()
+                        ],
+                        '_metadata' => [
+                                'timestamp' => time()
+                        ]
+                ]
+        );
+        $server->sendToClient($fd, $response);
+        // Pequeña pausa
+        //Coroutine::sleep(0.05);
+        $server->safeSleep(0.05);
+        // Ejecutar reload
+        $server->reload();
+        return null; // Ya enviamos la respuesta
+    });
+
     $server->registerRpcMethod(method: 'math.calculate', handler: function ($server, $params, $fd) {
         $operation = $params['operation'] ?? 'add';
         $numbers = $params['numbers'] ?? [];
@@ -450,16 +508,43 @@ try {
           //  $healthManager->setupServerTick($server, $workerId);
         }
     });
-    $server->onBefore('workerStop', function (Fluxus $server, int $workerId) use ($logger, $healthManager, $connector) {
-        $logger->debug("Finishing Worker #{$workerId}...");
-        if ($workerId < $server->setting['worker_num']) {
-            $logger->debug('🚥 Worker #' . $workerId . ' Stop pinging health checks...');
-          //  $healthStop = $healthManager->stopGracefully(3);
-            $logger->debug('🔐 Worker #' . $workerId . ' Closing database connections...');
-            $connector->closeAllPools();
-            $logger?->info("Worker #$workerId: Continuando shutdown del servidor $server->serverId...");
-            //$server->gracefulShutdown();
+
+    $server->onBefore('workerStop', function (Fluxus $server, int $workerId) use ($logger, $healthManager, $connector, $globalShutdownInitiated, $shutdownLock) {
+        $logger->debug("Worker #{$workerId} deteniéndose...");
+
+        // Solo un worker ejecuta limpieza global
+        $shutdownLock->lock();
+        try {
+            if ($globalShutdownInitiated->get() === 0) {
+                $globalShutdownInitiated->set(1);
+
+                $logger->debug("Worker #{$workerId} ejecutando limpieza global...");
+
+                // 1. Detener health checks
+                $logger->debug('🚥 Deteniendo health checks...');
+                // $healthManager->stopGracefully(3);
+
+                // 2. Cerrar conexiones de DB
+                $logger->debug('🔐 Cerrando conexiones de base de datos...');
+                $connector->closeAllPools();
+
+                // 3. Marcar server como shutting down
+                if (method_exists($server, 'setShuttingDown')) {
+                    $server->setShuttingDown(true);
+                }
+
+                $logger->debug('✅ Limpieza global completada');
+            }
+        } finally {
+            $shutdownLock->unlock();
         }
+
+        // Cada worker hace su propia limpieza
+        $logger->debug("Worker #{$workerId} limpieza local...");
+
+        // Limpiar cualquier recurso específico del worker aquí
+
+        $logger->info("🙅🏼‍♂️ Worker #$workerId finalizado");
     });
     $server->onAfter('workerStop', function (Fluxus $server, int $workerId) use ($logger) {
         $logger->debug("🙅🏼‍♂️ Worker #{$workerId} finalizado");

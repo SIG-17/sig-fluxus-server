@@ -15,9 +15,11 @@ use SIG\Server\Protocol\Response\Type;
 use SIG\Server\Protocol\Status;
 use SIG\Server\RPC\RpcInternalPorcessorInterface;
 use Swoole\Coroutine;
+use Swoole\Coroutine\Channel;
 use Swoole\Http\Response;
 use Swoole\Server\Task;
 use Swoole\Table;
+use Swoole\Timer;
 use Swoole\WebSocket\Frame;
 use Swoole\WebSocket\Server;
 use Swoole\Http\Request;
@@ -55,13 +57,14 @@ class Fluxus extends Server
     private int $rpcRequestCounter = 0;
     public array $rpcHandlers = [];
     private array $rpcInternalProcessors = [];
-    private ?Coroutine\Channel $redisMessageChannel = null;
+    private ?Channel $redisMessageChannel = null;
     public string $serverId;
     private int $startTime;
     private(set) bool $initialized = false;
     public array $collectResponses = [];
     public array $collectChannels = [];
-    private bool $shuttingDown = false;
+    public bool $isShuttingDown = false;
+    protected ?Channel $shutdownChannel = null;
     private array $signalHandlers = [];
 
     public function __construct(
@@ -118,13 +121,12 @@ class Fluxus extends Server
             unset($options['enabled']);
         }
         $this->set($options);
-        $this->setupSignalHandlers();
         $this->setupPrivateEvents();
         $this->setupWorkerEvents();
         if ($this->isRedisEnabled()) {  // ← Ahora es correcto
             $this->redis = $this->redisClient();
             // Canal para comunicar mensajes Redis entre corutinas
-            $this->redisMessageChannel = new Coroutine\Channel(1000);
+            $this->redisMessageChannel = new Channel(1000);
         }
         $this->serverId = $this->getServerId();
     }
@@ -257,35 +259,65 @@ class Fluxus extends Server
 
     private function setupSignalHandlers(): void
     {
-        if (extension_loaded('pcntl')) {
-            $this->signalHandlers[SIGINT] = pcntl_signal(SIGINT, function () {
-                $this->handleShutdownSignal();
-            });
-            $this->signalHandlers[SIGTERM] = pcntl_signal(SIGTERM, function () {
-                $this->handleShutdownSignal();
-            });
-            $this->signalHandlers[SIGHUP] = pcntl_signal(SIGHUP, function () {
-                $this->handleReloadSignal();
-            });
-
-            // Configurar para procesar señales asincrónicamente
-            pcntl_async_signals(true);
-            $this->logger?->info("Manejadores de señales configurados");
+        if (!extension_loaded('pcntl')) {
+            $this->logger?->warning('PCNTL extension not loaded, signal handlers disabled');
+            return;
         }
-    }
+        $this->logger?->notice('🏗️ Check PIDs to detect master process...');
+        $this->logger?->info('👷🏿 PID: ' . posix_getpid());
+        $this->logger?->info('👷🏽‍♀️ server master_pid: ' . $this->master_pid);
+        $this->logger?->info('👷🏻‍♀️ myPID: ' . getmypid());
 
-    public function handleShutdownSignal(): void
-    {
-        if ($this->shuttingDown) {
+        // Solo configurar en el proceso maestro
+        if ($this->master_pid !== posix_getpid()) {
+            $this->logger?->warning('🚨 Signal handlers only supported in master process');
             return;
         }
 
-        //$this->shuttingDown = true;
-        $this->logger?->info("Señal de shutdown recibida, valuando shutdown graceful...");
-        // Ejecutar shutdown en una corutina para no bloquear el manejador de señales? mmmm...no se... algo no anda así
-        //  Coroutine::create(function() {
+        $this->logger?->info('🚧 Configurando manejadores de señales...');
+
+        // Manejar SIGTERM y SIGINT para shutdown graceful
+        pcntl_async_signals(true);
+
+        pcntl_signal(SIGTERM, function ($signo) {
+            $this->handleShutdownSignal($signo, 'SIGTERM');
+        });
+
+        pcntl_signal(SIGINT, function ($signo) {
+            $this->handleShutdownSignal($signo, 'SIGINT');
+        });
+
+        // SIGUSR1 para reinicio graceful (opcional)
+        pcntl_signal(SIGUSR1, function ($signo) {
+            $this->logger?->info("Señal SIGUSR1 recibida, reinicio graceful...");
+            $this->reload();
+        });
+    }
+
+    public function handleShutdownSignal(int $signo, string $signalName): void
+    {
+        static $handled = false;
+        if ($handled || $this->isShuttingDown) {
+            $this->logger?->info('Shutdown ya en progreso, ignorando señal...');
+            return;
+        }
+
+        $handled = true;
+        $this->isShuttingDown = true;
+        $this->logger?->info("Señal $signalName recibida, iniciando shutdown graceful...");
+
+
+        // Notificar a las corrutinas de Redis que deben detenerse
+        $this->notifyRedisShutdown();
+
+        // 2. Iniciar shutdown del servidor
         $this->shutdown();
-        // });
+
+        // 3. Configurar timeout para forzar terminación
+        Timer::after(8000, function () use ($signalName) {
+            $this->logger?->warning("Shutdown timeout después de 8 segundos, forzando terminación...");
+            $this->stop();
+        });
     }
 
     private function handleReloadSignal(): void
@@ -366,12 +398,12 @@ class Fluxus extends Server
      */
     public function gracefulShutdown(): bool
     {
-        if ($this->shuttingDown) {
+        if ($this->isShuttingDown) {
             $this->logger?->warning("Shutdown already in progress. Ignoring...");
             return false;
         }
 
-        $this->shuttingDown = true;
+        $this->isShuttingDown = true;
         $this->logger?->info("Iniciando shutdown graceful del servidor $this->serverId...");
 
         // 1. Primero, detener el subscriber Redis (esto es crítico)
@@ -455,11 +487,11 @@ class Fluxus extends Server
      */
     public function shutdown(): bool
     {
-        if ($this->shuttingDown) {
+        if ($this->isShuttingDown) {
             $this->logger?->warning("Shutdown already in progress. Ignoring...");
             return false;
         }
-        $this->shuttingDown = true;
+        $this->isShuttingDown = true;
         $workerId = $this->getWorkerId();
         $this->logger?->info("🛑 Worker #$workerId: Ejecutando shutdown del servidor $this->serverId...");
         $this->runEventsAction('shutdown', [], 'before');
@@ -522,19 +554,54 @@ class Fluxus extends Server
         }
     }
 
- /*   public function start(): bool
-    {
-        $this->logger?->info("Iniciando servidor $this->serverId...");
-        return parent::start();
-    }*/
+    /*   public function start(): bool
+       {
+           $this->logger?->info("Iniciando servidor $this->serverId...");
+           return parent::start();
+       }*/
 
     public function startServices(): void
     {
         $this->logger?->info("Iniciando servicios en servidor $this->serverId...");
+        $this->setupSignalHandlers();
         //$this->registerDefaultRpcMethods();
         $this->startRedisServices();
 
         $this->logger?->info("Servicios WebSocket iniciados");
+    }
+
+
+// Método para notificar shutdown a Redis
+    protected function notifyRedisShutdown(): void
+    {
+        try {
+            // Si existe el canal de shutdown, enviar señal
+            if ($this->shutdownChannel && !$this->shutdownChannel->isFull()) {
+                $this->shutdownChannel->push(['shutdown' => true]);
+            }
+
+            // Cerrar conexión Redis si existe
+            if (property_exists($this, 'redis') && $this->redis instanceof \Redis) {
+                try {
+                    @$this->redis->close();
+                    $this->logger?->debug('Conexión Redis cerrada');
+                } catch (\Throwable $e) {
+                    // Ignorar errores de cierre
+                }
+            }
+
+            // Si existe subscriber de Redis, desconectarlo
+            if (property_exists($this, 'redisSubscriber') && $this->redisSubscriber) {
+                try {
+                    @$this->redisSubscriber->close();
+                    $this->logger?->debug('Redis subscriber desconectado');
+                } catch (\Throwable $e) {
+                    // Ignorar errores
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->logger?->debug('Error notificando shutdown a Redis: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -548,25 +615,21 @@ class Fluxus extends Server
 
         Coroutine::create(function () {
             $this->logger?->info('Iniciando corutina de subscriber Redis...');
-            $retryCount = 0;
-            $maxRetries = 5;
-
-            while ($retryCount < $maxRetries && $this->isRedisEnabled() && !$this->shuttingDown) {
+            $redisSub = $this->redisClient();
+            while (!$this->isShuttingDown) {
                 try {
-                    $redisSub = $this->redisClient();
-
                     if (!$redisSub->isConnected()) {
                         throw new \RuntimeException('Conexión Redis no establecida');
                     }
 
-                    $redisSub->setOption(Redis::OPT_READ_TIMEOUT, -1);
+                    $redisSub->setOption(Redis::OPT_READ_TIMEOUT, 2);
 
                     $this->logger?->info('Subscriber Redis conectado y escuchando canales...');
 
                     // Usar un timeout para psubscribe para poder salir
                     $redisSub->psubscribe([$this->redisChannelPrefix . '*'],
                         function ($redis, $pattern, $channel, $message) {
-                            if ($this->shuttingDown) {
+                            if ($this->isShuttingDown) {
                                 // Si estamos en shutdown, ignorar mensajes
                                 return;
                             }
@@ -579,26 +642,23 @@ class Fluxus extends Server
                     );
 
                     $this->logger?->warning('Subscriber Redis terminó inesperadamente');
-
-                } catch (\Exception $e) {
-                    if ($this->shuttingDown) {
-                        $this->logger?->info('Subscriber Redis detenido por shutdown');
-                        break;
+                    // Si psubscribe retorna (normalmente no debería), reconectar
+                    if (!$this->isShuttingDown) {
+                        $this->logger?->warning('Redis psubscribe retornó, reconectando...');
+                        $this->safeSleep(1);
+                        $redisSub = $this->redisClient();
                     }
 
-                    $retryCount++;
-                    $this->logger?->error("Error en subscriber Redis (intento $retryCount): " . $e->getMessage());
-
-                    if ($retryCount < $maxRetries && $this->isRedisEnabled() && !$this->shuttingDown) {
-                        $delay = min(30, 2 ** $retryCount);
-                        $this->logger?->info("Reintentando en $delay segundos...");
-                        $this->safeSleep($delay);
-                    } else {
-                        $this->logger?->error('Subscriber Redis falló después de ' . $maxRetries . ' intentos');
-                        break;
+                } catch (\Exception $e) {
+                    if (!$this->isShuttingDown) {
+                        $this->logger?->error('Error en Redis subscriber: ' . $e->getMessage());
+                        $this->safeSleep(2);
+                        $redisSub = $this->redisClient();
                     }
                 }
             }
+            $redisSub->close();
+            $this->logger?->debug('Redis subscriber finalizado por shutdown');
         });
     }
 
@@ -626,6 +686,30 @@ class Fluxus extends Server
      */
     private function startRedisMessageProcessor(): void
     {
+        while (!$this->isShuttingDown) {
+            try {
+                // Usar pop con timeout para poder verificar $this->isShuttingDown
+                $message = $this->redisMessageChannel->pop(1.0);
+
+                if ($message === false) {
+                    // Timeout, verificar si debemos continuar
+                    continue;
+                }
+
+                if (isset($message['shutdown'])) {
+                    break;
+                }
+
+                $this->handleRedisMessage($message['channel'], $message['message']);
+
+            } catch (\Throwable $e) {
+                if (!$this->isShuttingDown) {
+                    $this->logger?->error('Error procesando mensaje Redis: ' . $e->getMessage());
+                }
+            }
+        }
+/*
+        $this->logger?->debug('Redis message processor finalizado por shutdown');
         Coroutine::create(function () {
             while (true) {
                 $redisMessage = $this->redisMessageChannel->pop();
@@ -639,7 +723,7 @@ class Fluxus extends Server
                     $this->logger?->error('Error procesando mensaje Redis: ' . $e->getMessage());
                 }
             }
-        });
+        });*/
     }
 
     /**
