@@ -31,6 +31,7 @@ export default class VecturaPubSub extends EventTarget {
     MESSAGE_TYPE_FILE_AVAILABLE = 'file_available';
     MESSAGE_TYPE_FILE_RESPONSE = 'file_response';
     MESSAGE_TYPE_RPC_RESPONSE = 'rpc_response';
+    MESSAGE_TYPE_RPC_ERROR = 'rpc_error';
     MESSAGE_TYPE_RPC_METHODS = 'rpc_methods_list';
     MESSAGE_TYPE_ERROR = 'error';
     MESSAGE_TYPE_MESSAGE = 'message';
@@ -472,7 +473,7 @@ export default class VecturaPubSub extends EventTarget {
                     detail: data
                 }));
                 break;
-
+            case this.MESSAGE_TYPE_RPC_ERROR:
             case this.MESSAGE_TYPE_RPC_RESPONSE:
                 this.debug('RPC response received:', data);
                 this.handleRpcResponse(data);
@@ -819,9 +820,9 @@ export default class VecturaPubSub extends EventTarget {
                 this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_RPC_ACCEPTED, {
                     detail: {
                         id: data.id,
-                        worker_id: data.worker_id,
+                        worker_id: data._metadata?.worker_id,
                         method: handler.method,
-                        timestamp: data.timestamp
+                        timestamp: data._metadata?.timestamp
                     }
                 }));
                 this.debug(`RPC ${data.id} (${handler.method}) accepted by worker ${data.worker_id}`);
@@ -836,14 +837,15 @@ export default class VecturaPubSub extends EventTarget {
                         id: data.id,
                         method: handler.method,
                         result: data.result,
-                        execution_time: data.execution_time,
-                        timestamp: data.timestamp
+                        execution_time: data._metadata?.execution_time,
+                        timestamp: data._metadata?.timestamp
                     }
                 }));
                 break;
 
             case this.RPC_STATUS_ERROR:
             case this.RPC_STATUS_REJECTED:
+                console.trace(data);
                 this.error(`RPC ${data.id} (${handler.method}) failed:`, data.error?.message);
                 handler.reject(new Error(data.error?.message || 'Unknown RPC error'));
                 this.rpcHandlers.delete(data.id);
@@ -856,7 +858,7 @@ export default class VecturaPubSub extends EventTarget {
                         id: data.id,
                         method: handler.method,
                         error: data.error?.message || 'Unknown RPC error',
-                        timestamp: data.timestamp
+                        timestamp: data._metadata?.timestamp
                     }
                 }));
                 break;

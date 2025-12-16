@@ -112,7 +112,7 @@ $db_logger->pushHandler($db_handler);
 $poolCollection = require __DIR__ . '/../config/db-pool.php';
 $xmlDir = __DIR__ . '/../db/xml';
 $connector = new Connector(
-    logger: $logger
+        logger: $logger
 );
 $cacheManager = new RedisStorage($redisConfig['db-cache']);
 $loaderStorage = new XmlStatements(
@@ -130,11 +130,11 @@ $db = new DbProcessor(
 );
 
 
-$healthManager = new HealthManager(
+$healthManager = null; /*new HealthManager(
         connector: $db->connector,
         checkInterval: 30000, // 30 segundos
         logger: $logger
-);
+);*/
 
 $auth = new FakeAuth();
 
@@ -147,11 +147,12 @@ function handle_shutdown(LoggerInterface $logger, HealthManager $healthManager, 
     $handled = true;
     $connector->closeAllPools();
     $logger->info("🛑 Shutdown signal recibido");
-    $healthManager->stopGracefully();
+    $healthManager?->stopGracefully();
     // $server?->shutdown();
     // Aquí puedes agregar limpieza personalizada si es necesaria
     $logger->info("✅ Limpieza completada");
 }
+
 //<-- DB MANAGER
 try {
     $logger->info("🚀 Iniciando servidor WebSocket...");
@@ -263,7 +264,7 @@ try {
                 'worker_id' => $this->getWorkerId()
         ];
     }, description: 'Math RPC method. Usage: math.calculate?operation=add&numbers=1,2,3. Available operations: add, multiply, average, min, max.');
-    $server->registerRpcMethod('random.uuid', function ($server, $params, $fd) use ( $instance) {
+    $server->registerRpcMethod('random.uuid', function ($server, $params, $fd) use ($instance) {
         return [
                 'message' => uniqid($instance, true),
                 'timestamp' => time(),
@@ -302,7 +303,7 @@ try {
     }
     $server->registerRpcMethod(
             method: 'db.failures.retry.broadcast',
-            handler: function ($server, $params, $fd) use ( $logger, $healthManager) {
+            handler: function ($server, $params, $fd) use ($logger, $healthManager) {
                 $workerId = $server->getWorkerId();
                 $logger->info("📡 Broadcast de reconexión iniciado por cliente {$fd} en worker #{$workerId}");
 
@@ -325,7 +326,7 @@ try {
                         'source_worker' => $workerId,
                         'request_id' => uniqid('broadcast_', true),
                         'timestamp' => time()
-                ]);
+                ], JSON_THROW_ON_ERROR);
 
                 $sentCount = 0;
                 $totalWorkers = $server->setting['worker_num'] ?? 1;
@@ -359,7 +360,7 @@ try {
     );
     $server->registerRpcMethod(
             method: 'db.failures.retry',
-            handler: function ($server, $params, $fd) use ( $healthManager, $logger) {
+            handler: function ($server, $params, $fd) use ($healthManager, $logger) {
                 $logger->info("Forcing retry permanent db failures from client {$fd}");
                 return [
                         'status' => 'ok',
@@ -373,7 +374,7 @@ try {
             description: 'Forces retry of permanent failures in the database connection pool',
             only_internal: true
     );
-    $server->registerRpcMethod('health.status', function ($server, $params, $fd) use ( $healthManager) {
+    $server->registerRpcMethod('health.status', function ($server, $params, $fd) use ($healthManager) {
         return [
                 'status' => 'ok',
                 'health' => $healthManager->getHealthStatus(),
@@ -381,7 +382,7 @@ try {
                 'worker_id' => $server->getWorkerId()
         ];
     });
-    $server->registerRpcMethod('health.check.now', function ($server, $params, $fd) use ( $healthManager, $logger) {
+    $server->registerRpcMethod('health.check.now', function ($server, $params, $fd) use ($healthManager, $logger) {
         $logger->info("Forcing health check from client {$fd}");
         // Ejecutar check inmediato
         $healthManager->performHealthChecks($server->getWorkerId());
@@ -418,8 +419,8 @@ try {
     $server->onBefore('shutdown', function () use ($logger, $healthManager, $connector, $server) {
         $logger->debug("🛑 Graceful shutdown starting, wait... 🛑");
         $logger->debug('🚥 Stop pinging health checks...');
-        $healthStop = $healthManager->stopGracefully(1);
-        $logger->debug("Health stopped: " . var_export($healthStop, true));
+     //   $healthStop = $healthManager->stopGracefully(3);
+    //    $logger->debug("Health stopped: " . var_export($healthStop, true));
         $logger->debug('🔐 Closing database connections...');
         $connector->closeAllPools();
         $server->safeSleep(0.05);
@@ -438,7 +439,7 @@ try {
         // Pero NO registres señales aquí
     });
     // **OPCIONAL: Callback para worker start (si usas modo process)**
-    $server->onBefore('workerStart', function (Fluxus $server, int $workerId) use ($logger, $healthManager) {
+    $server->onBefore('workerStart', function (Fluxus $server, int $workerId) use ($logger) {
         $logger->info("👷 Worker #{$workerId} iniciando PID: {$server->getWorkerPid($workerId)}");
     });
     $server->onAfter('workerStart', function (Fluxus $server, int $workerId) use ($logger, $healthManager) {
@@ -446,18 +447,18 @@ try {
         // Solo workers principales (no task workers)
         if ($workerId < $server->setting['worker_num']) {
             // Iniciar health checks con escalonamiento automático
-            $healthManager->setupServerTick($server, $workerId);
+          //  $healthManager->setupServerTick($server, $workerId);
         }
     });
     $server->onBefore('workerStop', function (Fluxus $server, int $workerId) use ($logger, $healthManager, $connector) {
         $logger->debug("Finishing Worker #{$workerId}...");
         if ($workerId < $server->setting['worker_num']) {
             $logger->debug('🚥 Worker #' . $workerId . ' Stop pinging health checks...');
-            $healthStop = $healthManager->stopGracefully(1);
+          //  $healthStop = $healthManager->stopGracefully(3);
             $logger->debug('🔐 Worker #' . $workerId . ' Closing database connections...');
             $connector->closeAllPools();
-            $logger?->info("Worker #$workerId: Ejecutando shutdown del servidor $server->serverId...");
-            $server->gracefulShutdown();
+            $logger?->info("Worker #$workerId: Continuando shutdown del servidor $server->serverId...");
+            //$server->gracefulShutdown();
         }
     });
     $server->onAfter('workerStop', function (Fluxus $server, int $workerId) use ($logger) {

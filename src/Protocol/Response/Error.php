@@ -7,6 +7,7 @@ use SIG\Server\Protocol\Response\Base;
 class Error extends Base implements ResponseInterface
 {
     protected(set) ?string $message;
+    protected(set) ?string $code;
 
     public function __construct(
         ?array                $values = [],

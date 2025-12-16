@@ -13,11 +13,15 @@ class Type extends AbstractDescriptor
     protected(set) string $fileAvailable = 'file_available';
     protected(set) string $fileResponse = 'file_response';
     protected(set) string $rpcResponse = 'rpc_response';
+    protected(set) string $rpcError = 'rpc_error';
     protected(set) string $rpcMethodsList = 'rpc_methods_list';
     protected(set) string $authResponse = 'auth_response';
     protected(set) string $channelsList = 'channel_list';
     protected(set) string $rpcMethodList = 'rpc_method_list';
 
+    /**
+     * @throws UnexpectedValueException
+     */
     public function getProtocolFor(array $data): Base|ResponseInterface
     {
         if (isset($data['type']) && in_array($data['type'], $this->toArray())) {

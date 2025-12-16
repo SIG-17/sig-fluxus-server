@@ -81,7 +81,7 @@ class Rpc extends Base implements RequestHandlerInterface
                 'type' => $server->responseProtocol->get('rpcResponse'),
                 'id' => $requestId,
                 'status' => Status::accepted->value,
-                'stats' => [
+                '_metadata' => [
                     'worker_id' => $workerId,
                     'timestamp' => time()
                 ]

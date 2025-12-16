@@ -10,6 +10,7 @@ use SIG\Server\Exception\AuthenticationException;
 use SIG\Server\Exception\UnexpectedValueException;
 use SIG\Server\Protocol\Request\Action;
 use SIG\Server\Protocol\Request\RequestHandlerInterface;
+use SIG\Server\Protocol\Response\Rpc;
 use SIG\Server\Protocol\Response\Type;
 use SIG\Server\Protocol\Status;
 use SIG\Server\RPC\RpcInternalPorcessorInterface;
@@ -366,6 +367,7 @@ class Fluxus extends Server
     public function gracefulShutdown(): bool
     {
         if ($this->shuttingDown) {
+            $this->logger?->warning("Shutdown already in progress. Ignoring...");
             return false;
         }
 
@@ -454,6 +456,7 @@ class Fluxus extends Server
     public function shutdown(): bool
     {
         if ($this->shuttingDown) {
+            $this->logger?->warning("Shutdown already in progress. Ignoring...");
             return false;
         }
         $this->shuttingDown = true;
@@ -519,11 +522,11 @@ class Fluxus extends Server
         }
     }
 
-    public function start(): bool
+ /*   public function start(): bool
     {
         $this->logger?->info("Iniciando servidor $this->serverId...");
         return parent::start();
-    }
+    }*/
 
     public function startServices(): void
     {
@@ -945,6 +948,7 @@ class Fluxus extends Server
         // ya está escuchando todos los canales con el patrón 'ws_channel:*'
         // La suscripción en Redis se maneja automáticamente con psubscribe
     }
+
     /**
      * Evento cuando un cliente se desconecta
      */
@@ -996,6 +1000,7 @@ class Fluxus extends Server
 
         $this->logger?->info("FD $fd desuscrito del canal: $channel");
     }
+
     /**
      * Transmite un mensaje a todos los suscriptores de un canal
      * Retorna el número de clientes que recibieron el mensaje
@@ -1077,7 +1082,7 @@ class Fluxus extends Server
         $response = $this->responseProtocol->getProtocolFor([
             'type' => $this->responseProtocol->get('error'),
             'message' => $error,
-            'stats' => [
+            '_metadata' => [
                 'worker_id' => $this->getWorkerId(),
                 'timestamp' => time()
             ]
@@ -1189,90 +1194,6 @@ class Fluxus extends Server
     }
 
     /**
-     * Maneja solicitudes RPC
-     */
-    private function handleRpc(int $fd, array $data): void
-    {
-        $requestId = $data['id'] ?? $this->generateRpcId();
-        $method = $data['method'] ?? '';
-        $params = $data['params'] ?? [];
-        $timeout = isset($data['timeout']) ? (int)$data['timeout'] : 30;
-        $workerId = $this->getWorkerId();
-        while ($this->initialized === false) {
-            $this->logger?->info('Worker #' . $workerId . ' initializing, waiting...');
-            //usleep(100000);
-            $this->safeSleep(0.1);
-        }
-        try {
-            if (empty($method)) {
-                $this->sendRpcError($fd, $requestId, 'Method not specified');
-                return;
-            }
-            if (!is_string($method)) {
-                $this->sendRpcError($fd, $requestId, 'Method must be a string');
-                return;
-            }
-            $this->logger?->debug("📨 RPC recibido en worker #{$workerId}: $method (ID: $requestId)");
-            $this->logger?->debug("📋 Handlers en worker #{$workerId}: " . count($this->rpcHandlers));
-
-            // Si el método no está en handlers, fallar inmediatamente
-            if (!isset($this->rpcHandlers[$method])) {
-                $this->logger?->error("❌ Método $method no disponible en worker #{$workerId}");
-                $this->sendRpcError($fd, $requestId, "Servicio no disponible temporalmente", 503);
-                return;
-            }
-
-            // Verificar en tabla para metadata
-            $requiresAuth = false;
-            if ($this->rpcMethods->exist($method)) {
-                $methodInfo = $this->rpcMethods->get($method);
-                $requiresAuth = (bool)$methodInfo['requires_auth'];
-            }
-
-            if ($requiresAuth && !$this->isAuthenticated($fd)) {
-                $this->sendRpcError($fd, $requestId, 'No autenticado', 401);
-                return;
-            }
-            $roles = isset($methodInfo['allowed_roles']) ? explode('|', $methodInfo['allowed_roles']) : ['ws:general', 'ws:user'];
-            if (!empty($roles) && !in_array('ws:general', $roles, false) && empty(array_intersect($roles, $this->userRoles($fd)))) {
-                $this->sendRpcError($fd, $requestId, 'No autorizado', 403);
-                return;
-            }
-            // Confirmación de aceptación de RPC
-            $this->sendToClient($fd, [
-                'type' => 'rpc_response',
-                'id' => $requestId,
-                'status' => 'accepted',
-                'worker_id' => $workerId,
-                'timestamp' => time()
-            ]);
-
-            // Guardar solicitud
-            $this->rpcRequests->set($requestId, [
-                'request_id' => $requestId,
-                'fd' => $fd,
-                'method' => $method,
-                'params' => json_encode($params),
-                'created_at' => time(),
-                'status' => 'pending',
-                'worker_id' => $workerId
-            ]);
-
-            $this->logger?->debug("🚀 Ejecutando RPC: $method en worker #{$workerId}");
-
-            // Ejecutar en corutina
-            Coroutine::create(function () use ($fd, $requestId, $method, $params, $timeout, $workerId) {
-                $this->executeRpcMethod($fd, $requestId, $method, $params, $timeout, $workerId);
-            });
-
-
-        } catch (\Exception $e) {
-            $this->logger?->error("❌ Error procesando RPC: " . $e->getMessage());
-            $this->sendRpcError($fd, $requestId, 'Error interno del servidor');
-        }
-    }
-
-    /**
      * Ejecuta un método RPC en una corutina
      */
     public function executeRpcMethod(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
@@ -1299,11 +1220,14 @@ class Fluxus extends Server
                 $executionTime = round((microtime(true) - $startTime) * 1000, 2);
                 // Agregar metadata al resultado
                 if (is_array($result)) {
-                    $result['_metadata'] = [
+                    if (!isset($result['_metadata'])) {
+                        $result['_metadata'] = [];
+                    }
+                    $result['_metadata'] = array_merge($result ['_metadata'], [
                         'execution_time_ms' => $executionTime,
                         'worker_id' => $workerId,
                         'request_id' => $requestId
-                    ];
+                    ]);
                 }
 
                 // Enviar resultado
@@ -1328,27 +1252,29 @@ class Fluxus extends Server
 
     /**
      * Maneja errores de RPC
+     *
+     * private function handleRpcError(int $fd, string $requestId, string $method, \Exception $e): void
+     * {
+     * $this->logger?->error("Error ejecutando RPC $method: " . $e->getMessage());
+     * $this->sendRpcError($fd, $requestId, $e->getMessage());
+     * $this->updateRpcRequest($requestId, 'failed');
+     * }
      */
-    private function handleRpcError(int $fd, string $requestId, string $method, \Exception $e): void
-    {
-        $this->logger?->error("Error ejecutando RPC $method: " . $e->getMessage());
-        $this->sendRpcError($fd, $requestId, $e->getMessage());
-        $this->updateRpcRequest($requestId, 'failed');
-    }
-
     /**
      * Envía resultado RPC al cliente
      */
     private function sendRpcResult(int $fd, string $requestId, $result, float $executionTime): void
     {
-        $response = [
-            'type' => 'rpc_response',
+        $response = $this->responseProtocol->getProtocolFor([
+            'type' => $this->responseProtocol->get('rpcResponse'),
             'id' => $requestId,
-            'status' => 'success',
+            'status' => Status::success,
             'result' => $result,
-            'execution_time' => $executionTime,
-            'timestamp' => time()
-        ];
+            '_metadata' => [
+                'execution_time' => $executionTime,
+                'timestamp' => time()
+            ]
+        ]);
 
         $this->sendToClient($fd, $response);
     }
@@ -1358,16 +1284,18 @@ class Fluxus extends Server
      */
     public function sendRpcError(int $fd, string $requestId, string $error, int $code = 500): void
     {
-        $response = [
-            'type' => 'rpc_response',
+        $response = $this->responseProtocol->getProtocolFor([
+            'type' => $this->responseProtocol->get('rpcError'),
             'id' => $requestId,
-            'status' => 'error',
+            'status' => Status::error,
             'error' => [
                 'code' => $code,
                 'message' => $error
             ],
-            'timestamp' => time()
-        ];
+            '_metadata' => [
+                'timestamp' => time()
+            ]
+        ]);
         $this->logger?->error("Error RPC: $requestId ($error)");
 
         $this->sendToClient($fd, $response);
@@ -1524,7 +1452,7 @@ class Fluxus extends Server
 
         try {
             // Ejecutar el método (usar FD 0 o null para indicar broadcast interno)
-            $result = $this->rpcHandlers[$method]($params, 0);
+            $result = $this->rpcHandlers[$method]($this, $params, 0);
 
             $this->logger?->info("✅ RPC broadcast ejecutado: {$method} en worker #{$currentWorkerId}");
 
@@ -1581,6 +1509,7 @@ class Fluxus extends Server
 
         return array_unique(array_filter(array_merge($roles, ...$rpcRoles)));
     }
+
     /**
      * Verifica si un cliente está autenticado
      */
@@ -1588,6 +1517,7 @@ class Fluxus extends Server
     {
         return $this->auth?->isAuthenticated($fd) ?? true;
     }
+
     public function userRoles(int $fd): ?array
     {
         return $this->auth?->getRoles($fd);

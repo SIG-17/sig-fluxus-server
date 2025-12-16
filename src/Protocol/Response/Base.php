@@ -19,10 +19,10 @@ class Base extends AbstractDescriptor
         }
     }
 
-    protected(set) ?Stats $stats {
+    protected(set) ?Stats $_metadata {
         set(Stats|array|null $stats) {
             $stats = is_array($stats) ? new Stats($stats) : $stats;
-            $this->stats = $stats;
+            $this->_metadata = $stats;
         }
     }
 

@@ -55,7 +55,7 @@ class Publish extends Base implements RequestHandlerInterface
             'type' => 'message',
             'channel' => $this->channel,
             'data' => $this->data,
-            'stats' => [
+            '_metadata' => [
                 'timestamp' => time(),
                 'publisher' => $fd,
                 'origin_server' => $server->getServerId() // Identificar origen

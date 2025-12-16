@@ -59,7 +59,7 @@ class ListRpcMethods extends Base implements RequestHandlerInterface
             'type' => $server->responseProtocol->get('rpcMethodsList'),
             'methods' => $methods,
             'total' => count($methods),
-            'stats' => [
+            '_metadata' => [
                 'worker_id' => $workerId,
                 'timestamp' => time()
             ]

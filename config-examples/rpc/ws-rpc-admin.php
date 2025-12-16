@@ -14,18 +14,23 @@ $base = [
         'only_internal' => false,
         'handler' => static function (Fluxus $server, $params, $fd) {
             $server->logger->info("Forcing reload from client {$fd}");
-            // Enviar respuesta primero
-            $server->sendToClient($fd, [
-                'type' => 'rpc_response',
-                'id' => $params['id'] ?? '',
-                'status' => 'success',
-                'result' => [
-                    'status' => 'ok',
-                    'message' => 'Reload executed',
-                    'timestamp' => time()
-                ],
-                'timestamp' => time()
-            ]);
+            // Enviar respuesta
+            $response = $server->responseProtocol->getProtocolFor(
+                [
+                    'type' => $server->responseProtocol->get('rpcResponse'),
+                    'id' => $params['id'] ?? '',
+                    'status' => Status::success,
+                    'result' => [
+                        'status' => Status::ok->value ,
+                        'message' => 'Reload executed',
+                        'timestamp' => time()
+                    ],
+                    '_metadata' => [
+                        'timestamp' => time()
+                    ]
+                ]
+            );
+            $server->sendToClient($fd, $response);
             // Pequeña pausa
             //Coroutine::sleep(0.05);
             $server->safeSleep(0.05);
@@ -45,18 +50,21 @@ $base = [
             // Ejecutar en corutina para no bloquear
             $server->runInCoroutineIfPossible(function () use ($server, $params, $fd) {
                 // Enviar respuesta al cliente antes de shutdown
-                $server->sendToClient($fd, [
-                    'type' => 'rpc_response',
-                    'id' => $params['id'] ?? '',
-                    'status' => 'success',
-                    'result' => [
-                        'status' => 'ok',
-                        'message' => '🛑 Shutdown initiated',
-                        //   'health_stopped' => $healthStop,
-                        //  'connection_pools' => $connector->getPoolStats()
-                    ],
-                    'timestamp' => time()
-                ]);
+                $response = $server->responseProtocol->getProtocolFor(
+                    [
+                        'type' => $server->responseProtocol->get('rpcResponse'),
+                        'id' => $params['id'] ?? '',
+                        'status' => Status::success,
+                        'result' => [
+                            'status' => Status::ok->value ,
+                            'message' => '🛑 Shutdown initiated',
+                        ],
+                        '_metadata' => [
+                            'timestamp' => time()
+                        ]
+                    ]
+                );
+                $server->sendToClient($fd, $response);
                 // Pequeña pausa para que el mensaje llegue
                 $server->safeSleep(0.05);
                 // Ejecutar shutdown
@@ -94,7 +102,7 @@ $base = [
         'allowed_roles' => ['ws:admin'],
         'only_internal' => false,
         'handler' => static function (Fluxus $server, $params, $fd) {
-    return $server->userRoles($fd);
+            return $server->userRoles($fd);
         }
     ]
 ];

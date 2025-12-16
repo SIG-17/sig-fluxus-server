@@ -34,7 +34,7 @@ class Authenticate extends Base implements RequestHandlerInterface
                 'roles' => array_unique(array_merge(['ws:user'], $server->auth->getRoles($fd))),
                 'permissions' => $server->auth->getPermissions($fd),
             ],
-            'stats' => [
+            '_metadata' => [
                 'client_fd' => $fd,
                 'server_time' => date('Y-m-d H:i:s'),
                 'worker_id' => $server->getWorkerId()
