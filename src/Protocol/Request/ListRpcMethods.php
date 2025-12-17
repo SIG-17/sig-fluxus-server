@@ -5,8 +5,6 @@ namespace SIG\Server\Protocol\Request;
 use SIG\Server\Exception\UnexpectedValueException;
 use SIG\Server\Fluxus;
 use SIG\Server\Protocol\Data\Method;
-use SIG\Server\Protocol\Request\Base;
-use SIG\Server\Protocol\Request\RequestHandlerInterface;
 use SIG\Server\Protocol\Response\ResponseInterface;
 
 class ListRpcMethods extends Base implements RequestHandlerInterface
@@ -19,24 +17,24 @@ class ListRpcMethods extends Base implements RequestHandlerInterface
     {
         $methods = [];
         $workerId = $server->getWorkerId();
-        while ($server->initialized === false) {
+        while ($server->isRunning() === false) {
             $server->logger?->info('Worker #' . $workerId . ' initializing, waiting...');
             //usleep(100000);
             $server->safeSleep(0.1);
         }
 
         $server->logger?->debug('🗂️ Propiedad rpcHandlers contiene ' . count($server->rpcHandlers) . ' métodos');
-        $server->logger?->debug('📟 Propiedad rpcMethods contiene ' . $server->rpcMethods->count());
+        $server->logger?->debug('📟 Propiedad rpcMethods contiene ' . $server->getRpcMethods()->count());
         // Listar métodos disponibles en ESTE worker
         foreach ($server->rpcHandlers as $methodName => $handler) {
             $requiresAuth = false;
-            $description = $server->getRpcMethodDescription($methodName);
+            $description = 'RPC method '.$methodName;
             $registeredAt = 0;
             $auth_roles = [];
 
             // Verificar en tabla si existe metadata
-            if ($server->rpcMethods->exist($methodName)) {
-                $methodInfo = $server->rpcMethods->get($methodName);
+            if ($server->getRpcMethods()->exist($methodName)) {
+                $methodInfo = $server->getRpcMethods()->get($methodName);
                 $requiresAuth = (bool)$methodInfo['requires_auth'];
                 $auth_roles = !empty($methodInfo['allowed_roles']) ? explode(',', $methodInfo['allowed_roles']) : [];
                 $description = $methodInfo['description'];

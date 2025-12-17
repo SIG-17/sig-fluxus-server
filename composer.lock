@@ -802,12 +802,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/Tabula17/satelles-omnia-roga.git",
-                "reference": "33e139b6fe43e4e61c5c3fd9a666821bdb6bc8f5"
+                "reference": "0dc94af1de4a9f865f3cfcc29946876f1d652bef"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/Tabula17/satelles-omnia-roga/zipball/33e139b6fe43e4e61c5c3fd9a666821bdb6bc8f5",
-                "reference": "33e139b6fe43e4e61c5c3fd9a666821bdb6bc8f5",
+                "url": "https://api.github.com/repos/Tabula17/satelles-omnia-roga/zipball/0dc94af1de4a9f865f3cfcc29946876f1d652bef",
+                "reference": "0dc94af1de4a9f865f3cfcc29946876f1d652bef",
                 "shasum": "",
                 "mirrors": [
                     {
@@ -868,7 +868,7 @@
                 "source": "https://github.com/Tabula17/satelles-omnia-roga/tree/main",
                 "issues": "https://github.com/Tabula17/satelles-omnia-roga/issues"
             },
-            "time": "2025-12-16T16:55:32+00:00"
+            "time": "2025-12-17T19:33:04+00:00"
         }
     ],
     "aliases": [],

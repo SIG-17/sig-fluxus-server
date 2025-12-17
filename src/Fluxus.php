@@ -10,7 +10,6 @@ use SIG\Server\Exception\AuthenticationException;
 use SIG\Server\Exception\UnexpectedValueException;
 use SIG\Server\Protocol\Request\Action;
 use SIG\Server\Protocol\Request\RequestHandlerInterface;
-use SIG\Server\Protocol\Response\Rpc;
 use SIG\Server\Protocol\Response\Type;
 use SIG\Server\Protocol\Status;
 use SIG\Server\RPC\RpcInternalPorcessorInterface;
@@ -19,7 +18,6 @@ use Swoole\Coroutine\Channel;
 use Swoole\Http\Response;
 use Swoole\Server\Task;
 use Swoole\Table;
-use Swoole\Timer;
 use Swoole\WebSocket\Frame;
 use Swoole\WebSocket\Server;
 use Swoole\Http\Request;
@@ -32,40 +30,87 @@ class Fluxus extends Server
 {
     use CoroutineHelper;
 
+    /**
+     * @var array|string[]
+     *  Swoole events:
+     * onStart
+     * onBeforeShutdown
+     * onShutdown
+     * onWorkerStart
+     * onWorkerStop
+     * onWorkerExit
+     * onConnect
+     * onReceive
+     * onPacket
+     * onClose
+     * onTask
+     * onFinish
+     * onPipeMessage
+     * onWorkerError
+     * onManagerStart
+     * onManagerStop
+     * onBeforeReload
+     * onAfterReload
+     * onBeforeHandshakeResponse
+     * onHandShake
+     * onOpen
+     * onMessage
+     * onRequest
+     * onDisconnect
+     *
+     */
     private array $privateEvents = [
         'start',
+        'onBeforeShutdown',
         'open',
         'message',
         'close',
         'request',
         'pipeMessage',
         'task',
-        'finish',
-        'workerStart',
-        'workerStop',
+        //'finish',
+         'workerStart',
+        //'workerStop',
+    ];
+    private array $hookableEvents = [
+        'start' => ['before', 'after'],
+        'shutdown' => ['before', 'after'],
+        'stop' => ['before', 'after'],
+        'close' => ['before', 'after'],
+        'pause' => ['before', 'after'],
+        'resume' => ['before', 'after']
+
+
     ];
     /**
      * @var array $eventHooks Array con propiedades: beforeAfter + evento
      */
     private array $eventHooks = [];
+    private array $cancelableCids = [];
+    private ?Redis $redisClient;
+    private ?Channel $redisMessageChannel = null;
+    public string $redisChannelPrefix = 'ws_channel:';
+    private bool $isShuttingDown = false;
+    private bool $isStopped = true;
+
     private Table $subscribers;
     public Table $channels;
-    public ?Redis $redis;
-    public string $redisChannelPrefix = 'ws_channel:';
+
+
     public Table $rpcMethods;
     public Table $rpcRequests;
     private int $rpcRequestCounter = 0;
     public array $rpcHandlers = [];
     private array $rpcInternalProcessors = [];
-    private ?Channel $redisMessageChannel = null;
-    public string $serverId;
+
+    private string $serverId;
     private int $startTime;
-    private(set) bool $initialized = false;
-    public array $collectResponses = [];
-    public array $collectChannels = [];
-    public bool $isShuttingDown = false;
-    protected ?Channel $shutdownChannel = null;
-    private array $signalHandlers = [];
+
+
+    private array $rpcMethodsQueue = [];
+    private array $rpcRequestsQueue = [];
+
+    private array $channelsQueue = [];
 
     public function __construct(
         TCPServerConfig                  $config,
@@ -76,45 +121,8 @@ class Fluxus extends Server
         public readonly ?LoggerInterface $logger = null
     )
     {
-        // Tabla para suscriptores (fd -> channel)
-        $this->subscribers = new Table(1024);
-        $this->subscribers->column('fd', Table::TYPE_INT);
-        $this->subscribers->column('channels', Table::TYPE_STRING, 4096);
-        $this->subscribers->create();
-
-        // Tabla para canales activos
-        $this->channels = new Table(512);
-        $this->channels->column('name', Table::TYPE_STRING, 255);
-        $this->channels->column('auto_subscribe', Table::TYPE_INT, 1);
-        $this->channels->column('subscriber_count', Table::TYPE_INT);
-        $this->channels->column('created_at', Table::TYPE_INT);
-        $this->channels->column('last_message_at', Table::TYPE_INT);
-        $this->channels->column('last_message_fd', Table::TYPE_INT);
-        $this->channels->column('requires_auth', Table::TYPE_INT, 1);
-        $this->channels->column('requires_role', Table::TYPE_STRING, 255);
-        $this->channels->create();
-
-        $this->rpcMethods = new Table(512);
-        $this->rpcMethods->column('name', Table::TYPE_STRING, 128);
-        $this->rpcMethods->column('description', Table::TYPE_STRING, 255);
-        $this->rpcMethods->column('requires_auth', Table::TYPE_INT, 1);
-        $this->rpcMethods->column('registered_by_worker', Table::TYPE_INT);
-        $this->rpcMethods->column('registered_at', Table::TYPE_INT);
-        $this->rpcMethods->column('allowed_roles', Table::TYPE_STRING, 4096);
-        $this->rpcMethods->column('only_internal', Table::TYPE_INT, 1);
-        $this->rpcMethods->create();
-
-        $this->rpcRequests = new Table(1024);
-        $this->rpcRequests->column('request_id', Table::TYPE_STRING, 32);
-        $this->rpcRequests->column('fd', Table::TYPE_INT);
-        $this->rpcRequests->column('method', Table::TYPE_STRING, 128);
-        $this->rpcRequests->column('params', Table::TYPE_STRING, 4096); // JSON
-        $this->rpcRequests->column('created_at', Table::TYPE_INT);
-        $this->rpcRequests->column('status', Table::TYPE_STRING, 20); // pending, processing, completed, failed
-        $this->rpcRequests->create();
 
         parent::__construct($config->host, $config->port, $config->mode ?? SWOOLE_BASE, $config->type ?? SWOOLE_SOCK_TCP);
-
         $sslEnabled = isset($config->ssl) && $config->ssl->enabled;
         $options = $sslEnabled ? array_merge($config->options, $config->ssl->toArray()) : $config->options;
         if ($sslEnabled) {
@@ -122,53 +130,25 @@ class Fluxus extends Server
         }
         $this->set($options);
         $this->setupPrivateEvents();
-        $this->setupWorkerEvents();
-        if ($this->isRedisEnabled()) {  // ← Ahora es correcto
-            $this->redis = $this->redisClient();
-            // Canal para comunicar mensajes Redis entre corutinas
-            $this->redisMessageChannel = new Channel(1000);
-        }
-        $this->serverId = $this->getServerId();
     }
 
-    public function on(string $event_name, callable $callback): bool
+    // EVENT MANAGEMENT RELATED METHODS
+    private function eventIsPrivate(string $event_name): bool
     {
-        if (in_array($event_name, $this->privateEvents, true)) {
-            if (!$this->onAfter($event_name, $callback)) {
-                $this->logger?->warning("Evento privado $event_name, acción no permitido");
-            }
-            return false;
-        }
-        $callbackWrapper = function (...$args) use ($callback, $event_name) {
-            $this->runEventsAction($event_name, $args, 'before');
-            $callback(...$args);
-            $this->runEventsAction($event_name, $args, 'after');
-        };
-        return parent::on($event_name, $callbackWrapper);
-        //return parent::on($event_name, $callback);
+        return in_array($event_name, $this->privateEvents, true);
     }
 
-    public function off(string $event_name, callable $callback): bool
+    private function eventIsHookable(string $event_name, string $when): bool
     {
-        if (in_array($event_name, $this->privateEvents, true)) {
-            if (!$this->onAfter($event_name, $callback)) {
-                $this->logger?->warning("Evento privado $event_name, acción no permitida");
-            }
-            return false;
-        }
-        $this->offEventHook($event_name, $callback);
-        foreach (['before', 'after'] as $when) {
-            $prop = $when . ucfirst($event_name);
-            if (isset($this->eventHooks[$prop])) {
-                $this->eventHooks[$prop] = array_diff($this->eventHooks[$prop], [$callback]);
-            }
-        }
-        return parent::on($event_name, static fn() => false);
-
+        return isset($this->hookableEvents[$event_name]) && in_array($when, $this->hookableEvents[$event_name], true);
     }
 
     private function onEventHook(string $event_name, callable $callback, string $when = 'after'): bool
     {
+        if (!$this->eventIsHookable($event_name, $when)) {
+            $this->logger?->warning("Evento $event_name no puede ser agregado en $when");
+            return false;
+        }
         $prop = $when . ucfirst($event_name);
         if (!isset($this->eventHooks[$prop])) {
             $this->eventHooks[$prop] = [];
@@ -188,26 +168,6 @@ class Fluxus extends Server
             return true;
         }
         return false;
-    }
-
-    private function runEventsAction(string $event_name, ?array $args = [], string $when = 'after'): void
-    {
-        $this->logger?->debug('Running event ' . $event_name . ' at ' . $when . '');
-        $prop = $when . ucfirst($event_name);
-        if ($prop === 'beforeWorkerStart') {
-            $this->initialized = false;
-        }
-        if (isset($this->eventHooks[$prop])) {
-            foreach ($this->eventHooks[$prop] as $callback) {
-                $callback(...$args);
-            }
-        }
-        if ($prop === 'afterWorkerStart') {
-            $this->initialized = true;
-        }
-        if ($prop === 'afterWorkerStop') {
-            $this->initialized = false;
-        }
     }
 
     public function onAfter(string $event_name, callable $callback): bool
@@ -230,204 +190,307 @@ class Fluxus extends Server
         return $this->offEventHook($event_name, $callback, 'before');
     }
 
-    private function onPrivateEvent(string $event_name, callable $callback): bool
+    public function on(string $event_name, callable $callback): bool
     {
-        $callbackWrapper = function (...$args) use ($callback, $event_name) {
-            $this->runEventsAction($event_name, $args, 'before');
-            $callback(...$args);
-            $this->runEventsAction($event_name, $args, 'after');
-        };
-        return parent::on($event_name, $callbackWrapper);
+        if ($this->eventIsPrivate($event_name)) {
+            if ($this->eventIsHookable($event_name, 'after') && $this->onAfter($event_name, $callback)) {
+                $this->logger?->warning("Evento privado $event_name, acción agregada en after::$event_name");
+            } else {
+                $this->logger?->warning("Evento privado $event_name, acción no permitido");
+            }
+            return false;
+        }
+        return parent::on($event_name, $callback);
     }
 
-    public function isRedisEnabled(): bool
+    public function off(string $event_name, callable $callback): bool
     {
-        return $this->redisConfig instanceof RedisConfig && $this->redisConfig->canConnect() && extension_loaded('redis');
+        if ($this->eventIsPrivate($event_name)) {
+            if (!$this->onAfter($event_name, $callback)) {
+                $this->logger?->warning("Evento privado $event_name, acción no permitida");
+            }
+            return false;
+        }
+        $this->offEventHook($event_name, $callback);
+        foreach (['before', 'after'] as $when) {
+            $prop = $when . ucfirst($event_name);
+            if (isset($this->eventHooks[$prop])) {
+                $this->eventHooks[$prop] = array_diff($this->eventHooks[$prop], [$callback]);
+            }
+        }
+        return parent::on($event_name, static fn() => false);
+
+    }
+
+    private function onPrivateEvent(string $event_name, callable $callback): bool
+    {
+        return parent::on($event_name, $callback);
+    }
+
+    public function runEventActions(string $event_name, array $args, string $when = 'after'): void
+    {
+        $this->logger?->debug("Buscando acciones para evento $event_name en $when");
+        $prop = $when . ucfirst($event_name);
+        if (isset($this->eventHooks[$prop])) {
+            $this->logger?->debug("Ejecutando acciones para evento $event_name en $when (" . count($this->eventHooks[$prop]) . " acciones)");
+            foreach ($this->eventHooks[$prop] as $callback) {
+                $callback(...$args);
+            }
+        }
+        $this->logger?->debug("Acciones para evento $event_name en $when ejecutadas");
+    }
+    // END EVENT MANAGEMENT RELATED METHODS
+
+    //SETUP AND INIT RELATED METHODS
+    private function initPubSubTables(): void
+    {
+        // Tabla para suscriptores
+        $this->subscribers = new Table(4096);
+        $this->subscribers->column('fd', Table::TYPE_INT);
+        $this->subscribers->column('channels', Table::TYPE_STRING, 255);
+        $this->subscribers->create();
+        $this->logger?->debug('Tabla de suscriptores creada');
+        // Tabla para canales activos
+        $this->channels = new Table(1024);
+        $this->channels->column('name', Table::TYPE_STRING, 255);
+        $this->channels->column('auto_subscribe', Table::TYPE_INT, 1);
+        $this->channels->column('subscriber_count', Table::TYPE_INT);
+        $this->channels->column('created_at', Table::TYPE_INT);
+        $this->channels->column('last_message_at', Table::TYPE_INT);
+        $this->channels->column('last_message_fd', Table::TYPE_INT);
+        $this->channels->column('requires_auth', Table::TYPE_INT, 1);
+        $this->channels->column('requires_role', Table::TYPE_STRING, 255);
+        $this->channels->create();
+        while ($arguments = array_shift($this->channelsQueue)) {
+            $this->addChannel(...$arguments);
+        }
+        $this->logger?->debug('Tabla de canales creada');
+    }
+
+    private function initRpcTables(): void
+    {
+
+        $this->rpcMethods = new Table(512);
+        $this->rpcMethods->column('name', Table::TYPE_STRING, 128);
+        $this->rpcMethods->column('description', Table::TYPE_STRING, 255);
+        $this->rpcMethods->column('requires_auth', Table::TYPE_INT, 1);
+        $this->rpcMethods->column('registered_by_worker', Table::TYPE_INT);
+        $this->rpcMethods->column('registered_at', Table::TYPE_INT);
+        $this->rpcMethods->column('allowed_roles', Table::TYPE_STRING, 4096);
+        $this->rpcMethods->column('only_internal', Table::TYPE_INT, 1);
+        $this->rpcMethods->create();
+        while ($config = array_shift($this->rpcMethodsQueue)) {
+            $this->registerRpcMethod(...$config);
+        }
+
+        $this->rpcRequests = new Table(1024);
+        $this->rpcRequests->column('request_id', Table::TYPE_STRING, 32);
+        $this->rpcRequests->column('fd', Table::TYPE_INT);
+        $this->rpcRequests->column('method', Table::TYPE_STRING, 128);
+        $this->rpcRequests->column('params', Table::TYPE_STRING, 4096); // JSON
+        $this->rpcRequests->column('created_at', Table::TYPE_INT);
+        $this->rpcRequests->column('status', Table::TYPE_STRING, 20); // pending, processing, completed, failed
+        $this->rpcRequests->create();
+    }
+
+    private function initializeOnWorkers(Server $server, int $workerId): void
+    {
+        $this->logger?->info("👷 Worker #{$workerId} iniciado - PID: " . posix_getpid());
+
+        // Inicializar procesadores RPC internos
+        $this->initializeRpcInternalProcessors();
     }
 
     private function setupPrivateEvents(): void
     {
-        $this->onPrivateEvent('start', [$this, 'startServices']);
+
+        $this->onPrivateEvent('start', function () {
+            $this->logger?->debug('Iniciando servicios...');
+            $this->initializeServices();
+        });
+        $this->onPrivateEvent('beforeShutdown', function () {
+            $this->isShuttingDown = true;
+            $this->logger?->debug('🛑 Deteniendo servicios...');
+            $this->cleanUpServer();
+        });
+        $this->onPrivateEvent('workerStart', function () {
+            $this->initializeOnWorkers($this, $this->getWorkerId());
+        });
         $this->onPrivateEvent('open', [$this, 'handleOpen']);
         $this->onPrivateEvent('message', [$this, 'handleMessage']);
         $this->onPrivateEvent('close', [$this, 'handleClose']);
         $this->onPrivateEvent('request', [$this, 'handleRequest']);
         $this->onPrivateEvent('pipeMessage', [$this, 'handlePipeMessage']);
         $this->onPrivateEvent('task', [$this, 'handleTask']);;
-
     }
 
-    private function setupSignalHandlers(): void
+    private function initializeServices(): void
     {
-        if (!extension_loaded('pcntl')) {
-            $this->logger?->warning('PCNTL extension not loaded, signal handlers disabled');
-            return;
-        }
-        $this->logger?->notice('🏗️ Check PIDs to detect master process...');
-        $this->logger?->info('👷🏿 PID: ' . posix_getpid());
-        $this->logger?->info('👷🏽‍♀️ server master_pid: ' . $this->master_pid);
-        $this->logger?->info('👷🏻‍♀️ myPID: ' . getmypid());
-
-        // Solo configurar en el proceso maestro
-        if ($this->master_pid !== posix_getpid()) {
-            $this->logger?->warning('🚨 Signal handlers only supported in master process');
-            return;
-        }
-
-        $this->logger?->info('🚧 Configurando manejadores de señales...');
-
-        // Manejar SIGTERM y SIGINT para shutdown graceful
-        pcntl_async_signals(true);
-
-        pcntl_signal(SIGTERM, function ($signo) {
-            $this->handleShutdownSignal($signo, 'SIGTERM');
-        });
-
-        pcntl_signal(SIGINT, function ($signo) {
-            $this->handleShutdownSignal($signo, 'SIGINT');
-        });
-
-        // SIGUSR1 para reinicio graceful (opcional)
-        pcntl_signal(SIGUSR1, function ($signo) {
-            $this->logger?->info("Señal SIGUSR1 recibida, reinicio graceful...");
-            $this->reload();
-        });
-    }
-
-    public function handleShutdownSignal(int $signo, string $signalName): void
-    {
-        static $handled = false;
-        if ($handled || $this->isShuttingDown) {
-            $this->logger?->info('Shutdown ya en progreso, ignorando señal...');
-            return;
-        }
-
-        $handled = true;
-        $this->isShuttingDown = true;
-        $this->logger?->info("Señal $signalName recibida, iniciando shutdown graceful...");
-
-
-        // Notificar a las corrutinas de Redis que deben detenerse
-        $this->notifyRedisShutdown();
-
-        // 2. Iniciar shutdown del servidor
-        $this->shutdown();
-
-        // 3. Configurar timeout para forzar terminación
-        Timer::after(8000, function () use ($signalName) {
-            $this->logger?->warning("Shutdown timeout después de 8 segundos, forzando terminación...");
-            $this->stop();
-        });
-    }
-
-    private function handleReloadSignal(): void
-    {
-        $this->logger?->info("Señal de reload recibida (SIGHUP)");
-        $this->reload();
-    }
-
-    /**
-     * Configura eventos específicos para workers
-     */
-    private function setupWorkerEvents(): void
-    {
-        // Evento cuando un worker inicia
-        $this->onPrivateEvent('workerStart', [$this, 'handleWorkerStart']);
-
-        // Evento cuando un worker para
-        $this->onPrivateEvent('workerStop', [$this, 'handleWorkerStop']);
-    }
-
-    /**
-     * Maneja el inicio de un worker
-     */
-    public function handleWorkerStart(Server $server, int $workerId): void
-    {
-        $this->logger?->info("👷 Worker #{$workerId} iniciado - PID: " . posix_getpid());
-
-        // Inicializar procesadores RPC internos
+        $this->logger?->debug('Inicializando servicios...');
+        $this->startRedisServices();
         $this->initializeRpcInternalProcessors();
-        // Inicializar tabla RPC (solo worker 0)
-        //$this->initializeRpcMethodsTable();
-        // Registrar handlers RPC en ESTE worker (todos los workers)
-        //$this->registerRpcHandlersInWorker();
-        // Si es el worker 0, también inicializar Redis
-        if ($workerId === 0 && $this->isRedisEnabled()) {
-            $this->startRedisServices();
-        }
+        $this->runEventActions('start', [], 'after');
     }
 
-    /**
-     * Maneja la parada de un worker
-     */
-    public function handleWorkerStop(Server $server, int $workerId): void
+    // END SETUP AND INIT RELATED METHODS
+
+    // SERVER HOOKED METHODS
+    public function start(): bool
     {
-        $this->logger?->info("🙅🏼‍♂️ Worker #{$workerId} finalizado");
-        // Limpiar handlers de ESTE worker
-        $this->rpcHandlers = [];
+        $this->serverId = $this->getServerId();
+        $this->initRpcTables();
+        $this->initPubSubTables();
+        $this->isShuttingDown = false;
+        $this->isStopped = false;
+        $this->logger?->info('Iniciando servidor...');
+        $this->runEventActions('start', [], 'before');
+        $started = parent::start();
+        $this->logger?->info('Servidor iniciado');
+        $this->runEventActions('start', [], 'after');
+        return $started;
     }
 
-    public function registerInternalRpcProcessor(string $processorName, RpcInternalPorcessorInterface $processor): void
+    public function stop(int $workerId = -1, bool $waitEvent = false): bool
     {
-        if (isset($this->rpcInternalProcessors[$processorName]) && $this->rpcInternalProcessors[$processorName] === $processor) {
-            $this->logger?->warning('Processor ' . $processorName . ' already registered as internal RPC processor. Skipping...');
-            return;
-        }
-        $this->rpcInternalProcessors[$processorName] = $processor;
+        $this->isStopped = true;
+        $this->logger?->info('Deteniendo servidor...');
+        $args = func_get_args();
+        $this->runEventActions('stop', $args, 'before');
+        $stopped = parent::stop($workerId, $waitEvent);
+        $this->logger?->info('Servidor detenido');
+        $this->runEventActions('stop', $args, 'after');
+        return $stopped;
     }
 
-    public function getInternalRpcProcessor(string $processorName): ?RpcInternalPorcessorInterface
+    public function close(int $fd, bool $reset = false): bool
     {
-        return $this->rpcInternalProcessors[$processorName] ?? null;
+        $this->logger?->info('Reiniciando servidor...');
+        $this->runEventActions('close', [$fd, $reset], 'before');
+        $reloaded = parent::close($fd, $reset);
+        $this->logger?->info('Servidor reiniciado');
+        $this->runEventActions('close', [$fd, $reset], 'after');
+        return $reloaded;
     }
 
-    private function initializeRpcInternalProcessors(): void
+    public function shutdown(): bool
     {
-        foreach ($this->rpcInternalProcessors as $processor) {
-            $processor->init($this);
-        }
+        $this->isShuttingDown = true;
+        $this->logger?->info('Desconectando clientes...');
+        $shutdown = parent::shutdown();
+        $this->logger?->info('Servidor detenido');
+        $this->runEventActions('shutdown', [], 'after');
+        return $shutdown;
     }
 
-    public function getRpcHandler(string $method): ?callable
+    public function pause(int $fd): bool
     {
-        return $this->rpcHandlers[$method] ?? null;
+        $this->logger?->info('Pausando servidor...');
+        $this->runEventActions('pause', [$fd], 'before');
+        $paused = parent::pause($fd);
+        $this->logger?->info('Servidor pausado');
+        $this->runEventActions('pause', [$fd], 'after');
+        return $paused;
     }
 
-    /**
-     * Apaga el servidor gentilmente
-     */
-    public function gracefulShutdown(): bool
+    public function resume(int $fd): bool
     {
-        if ($this->isShuttingDown) {
-            $this->logger?->warning("Shutdown already in progress. Ignoring...");
+        $this->isStopped = false;
+        $this->logger?->info('Reanudando servidor...');
+        $this->runEventActions('resume', [$fd], 'before');
+        $resumed = parent::resume($fd);
+        $this->logger?->info('Servidor reanudado');
+        $this->runEventActions('resume', [$fd], 'after');
+        return $resumed;
+    }
+    // END SERVER HOOKED METHODS
+
+    // SERVER RELATED METHODS
+    public function isRunning(): bool
+    {
+        try {
+            $workerId = $this->getWorkerId();
+            $workerPid = $this->getWorkerPid($workerId);
+            $posixPid = posix_getpid();
+            // Verificar si podemos obtener estadísticas
+            $stats = $this->stats();
+            $running = isset($stats['start_time']) && $stats['start_time'] > 0 && !$this->isStopped && !$this->isShuttingDown;
+            if (!$running) {
+                $this->logger?->debug("#$workerId Comprobando estado del servidor: PID ={$this->master_pid}, wPID ={$workerPid}, pPID ={$posixPid}, stopped: {$this->isStopped}, shutting down: {$this->isShuttingDown}");
+            }
+            return $running;
+        } catch (\Throwable $e) {
             return false;
         }
+        //return $this->master_pid > 0 && posix_kill($this->master_pid, 0) && !$this->isStopped && !$this->isShuttingDown;
+    }
 
-        $this->isShuttingDown = true;
-        $this->logger?->info("Iniciando shutdown graceful del servidor $this->serverId...");
+    /**
+     * Verifica si una conexión WebSocket está establecida
+     */
+    public function isEstablished(int $fd): bool
+    {
+        try {
+            $info = $this->getClientInfo($fd);
+            return $info && $info['websocket_status'] === WEBSOCKET_STATUS_ACTIVE;
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
 
-        // 1. Primero, detener el subscriber Redis (esto es crítico)
-        if ($this->isRedisEnabled() && isset($this->redisMessageChannel)) {
-            $this->logger?->info("Cerrando canal Redis...");
-            $this->redisMessageChannel->close();
 
-            // Si tenemos una conexión Redis activa, desconectarla
-            if (isset($this->redis)) {
-                try {
-                    // Forzar desconexión del subscriber Redis
-                    $this->redis->close();
-                    $this->logger?->info("Conexión Redis cerrada");
-                } catch (\Exception $e) {
-                    $this->logger?->error("Error cerrando Redis: " . $e->getMessage());
-                }
-            }
+    /**
+     * Obtiene estadísticas del servidor
+     */
+    public function getStats(): array
+    {
+        return [
+            'server_id' => $this->getServerId(),
+            'clients' => count($this->connections ?? []),
+            'channels' => $this->channels->count(),
+            'subscribers' => $this->subscribers->count(),
+            'redis_enabled' => $this->isRedisEnabled()
+        ];
+    }
+
+    /**
+     * Obtiene uptime del servidor
+     */
+    public function getUptime(): string
+    {
+        if (!isset($this->startTime)) {
+            $this->startTime = time();
         }
 
-        // 2. Cerrar todas las conexiones de clientes
-        if (isset($this->subscribers) && $this->subscribers->valid()) {
-            $this->logger?->info("Cerrando conexiones de clientes...");
-            $closedCount = 0;
+        $uptime = time() - $this->startTime;
+        $hours = floor($uptime / 3600);
+        $minutes = floor(($uptime % 3600) / 60);
+        $seconds = $uptime % 60;
 
+        return sprintf("%02d:%02d:%02d", $hours, $minutes, $seconds);
+    }
+    private function cleanUpRpcProcessors(string $logPrefix = '🛑'): void
+    {
+        $this->logger?->debug("$logPrefix Limpiando procesadores RPC...");
+        foreach ($this->rpcInternalProcessors as $processor) {
+            if($processor instanceof RpcInternalPorcessorInterface) {
+                $processor->deInit($this);
+            }
+        }
+    }
+
+    private function cleanUpRpcTables(string $logPrefix = '🛑'): void
+    {
+        $this->rpcMethods->destroy();
+        $this->rpcRequests->destroy();
+        $this->logger?->info("$logPrefix Tablas RPC eliminadas");
+    }
+
+    private function cleanUpPubSub(string $logPrefix = '🛑'): void
+    {
+        $workerId = $this->getWorkerId();
+        if (isset($this->subscribers) && $this->subscribers->valid()) {
+            $this->logger?->info("$logPrefix #$workerId Cerrando conexiones de clientes...");
+            $closedCount = 0;
             foreach ($this->subscribers as $subscriber) {
                 $fd = $subscriber['fd'];
                 if ($this->isEstablished($fd)) {
@@ -439,195 +502,182 @@ class Fluxus extends Server
                     }
                 }
             }
-            $this->logger?->info("$closedCount conexiones de clientes cerradas");
+            $this->logger?->info("$logPrefix #$workerId -> $closedCount conexiones de clientes cerradas");
         }
-
-        // 3. Ejecutar hooks de before shutdown
-        $this->runEventsAction('shutdown', [], 'before');
-
-        $this->logger?->info("Shutdown graceful completado");
-        return true;
+        $this->subscribers->destroy();
+        $this->channels->destroy();
+        $this->logger?->debug("$logPrefix #$workerId Tablas de canales y suscriptores eliminadas");
     }
 
-    public function __destruct()
+    private function cleanUpServer(): void
     {
-        $this->logger?->info("🧹 Ejecutando limpieza final del servidor $this->serverId...");
-        // Cerrar conexión Redis si existe
-        if (isset($this->redis)) {
-            if (isset($this->redisMessageChannel)) {
-                $this->redisMessageChannel->close();
-            }
-            try {
-                $this->redis->close();
-            } catch (\Exception $e) {
-                // Ignorar errores en destructor
+        $workerId = $this->getWorkerId();
+        $this->logger?->info("🧹 #$workerId Limpiando recursos...");
+        $this->stopRedisServices("🧹");
+        //foreach ($this->cancelableCids as $cid) {
+        while ($cid = array_shift($this->cancelableCids)) {
+            if (Coroutine::exists($cid)) {
+                $this->logger?->debug("🧹 #$workerId Cancelando corutina $cid");
+                Coroutine::cancel($cid);
             }
         }
-
-        // Limpiar tablas
-        if (isset($this->subscribers)) {
-            $this->subscribers->destroy();
-        }
-        if (isset($this->channels)) {
-            $this->channels->destroy();
-        }
-        if (isset($this->rpcMethods)) {
-            $this->rpcMethods->destroy();
-        }
-        if (isset($this->rpcRequests)) {
-            $this->rpcRequests->destroy();
-        }
-
-        $this->logger?->info("✅ Limpieza completada");
-        parent::__destruct();
+        $this->cleanUpPubSub("🧹");
+        $this->cleanUpRpcProcessors("🧹");
+        $this->cleanUpRpcTables();
+        $this->logger?->info("🧹 #$workerId Recursos limpiados");
     }
 
     /**
-     * Override del método shutdown de Swoole para manejo graceful
+     * Genera un ID único para este servidor
      */
-    public function shutdown(): bool
+    public function getServerId(): string
     {
-        if ($this->isShuttingDown) {
-            $this->logger?->warning("Shutdown already in progress. Ignoring...");
+        static $serverId = null;
+        if ($serverId === null) {
+            $serverId = gethostname() . ':' . (getmypid() ?? uniqid(basename(str_replace('\\', '/', static::class)) . ':', false));
+        }
+        return $serverId;
+    }
+    // END SERVER RELATED METHODS
+
+    // REDIS RELATED METHODS
+    public function isRedisEnabled(): bool
+    {
+        return $this->redisConfig instanceof RedisConfig && $this->redisConfig->canConnect() && extension_loaded('redis');
+    }
+
+    /**
+     * Obtiene una instancia de Redis
+     * @param bool $replace
+     * @return Redis
+     */
+    public function redis(bool $replace = false): Redis
+    {
+        if ($replace || !isset($this->redisClient) || !$this->redisClient instanceof Redis) {
+            $this->redisClient = new Redis();
+            // Si no hay configuración Redis, retornar objeto vacío
+            if (!$this->isRedisEnabled()) {
+                return $this->redisClient;
+            }
+            $config = $this->redisConfig->toArray();
+            try {
+                $connected = $this->redisClient->connect(
+                    $config['host'] ?? '127.0.0.1',
+                    $config['port'] ?? 6379,
+                    $config['timeout'] ?? 2.5
+                );
+
+                if (!$connected) {
+                    throw new \RuntimeException('No se pudo conectar a Redis');
+                }
+
+                if (isset($config['auth'])) {
+                    $this->redisClient->auth($config['auth']);
+                }
+
+                if (isset($config['database'])) {
+                    $this->redisClient->select($config['database']);
+                }
+
+                // Verificar que Redis realmente funciona
+                if (!$this->redisClient->ping()) {
+                    throw new \RuntimeException('No se pudo verificar la conexión a Redis');
+                }
+
+                $this->logger?->info('Conexión a Redis establecida');
+                return $this->redisClient;
+
+            } catch (\Exception $e) {
+                $this->logger?->error('Error conectando a Redis: ' . $e->getMessage());
+                return $this->redisClient;
+            }
+        }
+        return $this->redisClient;
+    }
+
+    private function stopRedisServices(string $logPrefix = '🛑'): void
+    {
+        $workerId = $this->getWorkerId();
+        if ($this->redisMessageChannel !== null) {
+            $this->redisMessageChannel->close();
+            $this->redisMessageChannel = null;
+            $this->logger?->debug("$logPrefix #$workerId Canal de mensajes Redis cerrado");
+        }
+        if ($this->redisClient !== null) {
+            $this->redisClient->close();
+            $this->redisClient = null;
+            $this->logger?->info("$logPrefix #$workerId Conexión a Redis cerrada.");
+        }
+    }
+
+    private function startRedisServices(): bool
+    {
+        if (!$this->isRedisEnabled()) {
+            $this->logger?->warning("No se pueden iniciar los servicios Redis, no se han configurado");
             return false;
         }
-        $this->isShuttingDown = true;
-        $workerId = $this->getWorkerId();
-        $this->logger?->info("🛑 Worker #$workerId: Ejecutando shutdown del servidor $this->serverId...");
-        $this->runEventsAction('shutdown', [], 'before');
-        // 1. Ejecutar graceful shutdown primero
-        $this->gracefulShutdown();
-        // 2. Esperar un momento para que se completen las operaciones pendientes
-        //Coroutine::sleep(0.1);
-        $this->safeSleep(0.1);
-        // 3. Ejecutar hooks de after shutdown
-        $this->runEventsAction('shutdown', [], 'after');
-        // 4. Llamar al shutdown de Swoole
-        $result = parent::shutdown();
-        if ($result) {
-            $this->logger?->info("✅ Worker #$workerId: Shutdown completado");
-        } else {
-            $this->logger?->error("🚫 Worker #$workerId: Shutdown failed");
+
+        $this->redis(true);
+        // Canal para comunicar mensajes Redis entre corutinas
+        $this->redisMessageChannel = new Channel(1000);
+
+        $processor = $this->startRedisMessageProcessor();
+        if ($processor !== false) {
+            $this->cancelableCids[] = $processor;
         }
-        return $result;
-    }
-
-    private function redisClient(): Redis
-    {
-        $redis = new Redis();
-
-        // Si no hay configuración Redis, retornar objeto vacío
-        if (!$this->isRedisEnabled()) {
-            return $redis;
+        $subscriber = $this->startRedisSubscriber();
+        if ($subscriber !== false) {
+            $this->cancelableCids[] = $subscriber;
         }
 
-        $config = $this->redisConfig->toArray();
-
-        try {
-            $connected = $redis->connect(
-                $config['host'] ?? '127.0.0.1',
-                $config['port'] ?? 6379,
-                $config['timeout'] ?? 2.5
-            );
-
-            if (!$connected) {
-                throw new \RuntimeException('No se pudo conectar a Redis');
-            }
-
-            if (isset($config['auth'])) {
-                $redis->auth($config['auth']);
-            }
-
-            if (isset($config['database'])) {
-                $redis->select($config['database']);
-            }
-
-            // Verificar que Redis realmente funciona
-            $redis->ping();
-
-            $this->logger?->info('Conexión a Redis establecida');
-            return $redis;
-
-        } catch (\Exception $e) {
-            $this->logger?->error('Error conectando a Redis: ' . $e->getMessage());
-            return $redis;
-        }
+        return $processor && $subscriber;;
     }
 
-    /*   public function start(): bool
-       {
-           $this->logger?->info("Iniciando servidor $this->serverId...");
-           return parent::start();
-       }*/
-
-    public function startServices(): void
+    /**
+     * Procesa mensajes Redis de forma asincrónica
+     */
+    private function startRedisMessageProcessor(): int|false
     {
-        $this->logger?->info("Iniciando servicios en servidor $this->serverId...");
-        $this->setupSignalHandlers();
-        //$this->registerDefaultRpcMethods();
-        $this->startRedisServices();
-
-        $this->logger?->info("Servicios WebSocket iniciados");
-    }
-
-
-// Método para notificar shutdown a Redis
-    protected function notifyRedisShutdown(): void
-    {
-        try {
-            // Si existe el canal de shutdown, enviar señal
-            if ($this->shutdownChannel && !$this->shutdownChannel->isFull()) {
-                $this->shutdownChannel->push(['shutdown' => true]);
-            }
-
-            // Cerrar conexión Redis si existe
-            if (property_exists($this, 'redis') && $this->redis instanceof \Redis) {
-                try {
-                    @$this->redis->close();
-                    $this->logger?->debug('Conexión Redis cerrada');
-                } catch (\Throwable $e) {
-                    // Ignorar errores de cierre
+        return Coroutine::create(function () {
+            while (!$this->isShuttingDown && $this->redisMessageChannel !== null) {
+                if ($this->isRunning()) {
+                    $redisMessage = $this->redisMessageChannel->pop();
+                    if ($redisMessage === false) {
+                        continue; // Canal cerrado
+                    }
+                    try {
+                        $this->logger?->debug("Procesando mensaje Redis: " . var_export($redisMessage, true));
+                        $this->handleRedisMessage($redisMessage['channel'], $redisMessage['message']);
+                    } catch (\Exception $e) {
+                        $this->logger?->error('Error procesando mensaje Redis: ' . $e->getMessage());
+                    }
                 }
             }
-
-            // Si existe subscriber de Redis, desconectarlo
-            if (property_exists($this, 'redisSubscriber') && $this->redisSubscriber) {
-                try {
-                    @$this->redisSubscriber->close();
-                    $this->logger?->debug('Redis subscriber desconectado');
-                } catch (\Throwable $e) {
-                    // Ignorar errores
-                }
-            }
-        } catch (\Throwable $e) {
-            $this->logger?->debug('Error notificando shutdown a Redis: ' . $e->getMessage());
-        }
+        });
     }
 
     /**
      * Inicia el subscriber de Redis en una corutina bloqueante
      */
-    private function startRedisSubscriber(): void
+    private function startRedisSubscriber(): int|false
     {
         if (!$this->isRedisEnabled()) {
-            return;
+            $this->logger?->debug('Redis deshabilitado, no subscribimos al servicio. ');
+            return false;
         }
 
-        Coroutine::create(function () {
+        return Coroutine::create(function () {
             $this->logger?->info('Iniciando corutina de subscriber Redis...');
-            $redisSub = $this->redisClient();
             while (!$this->isShuttingDown) {
                 try {
-                    if (!$redisSub->isConnected()) {
+                    if (!$this->redisClient->isConnected() || !$this->redisClient->ping()) {
+                        $this->logger?->debug('Conexión Redis no establecida');
                         throw new \RuntimeException('Conexión Redis no establecida');
                     }
-
-                    $redisSub->setOption(Redis::OPT_READ_TIMEOUT, 2);
-
+                    $this->redisClient->setOption(Redis::OPT_READ_TIMEOUT, -1);
                     $this->logger?->info('Subscriber Redis conectado y escuchando canales...');
-
                     // Usar un timeout para psubscribe para poder salir
-                    $redisSub->psubscribe([$this->redisChannelPrefix . '*'],
+                    $this->redisClient->psubscribe([$this->redisChannelPrefix . '*'],
                         function ($redis, $pattern, $channel, $message) {
                             if ($this->isShuttingDown) {
                                 // Si estamos en shutdown, ignorar mensajes
@@ -641,94 +691,28 @@ class Fluxus extends Server
                         }
                     );
 
-                    $this->logger?->warning('Subscriber Redis terminó inesperadamente');
+                    $this->logger?->warning('Subscriber Redis terminó inesperadamente, reconectando');
                     // Si psubscribe retorna (normalmente no debería), reconectar
-                    if (!$this->isShuttingDown) {
-                        $this->logger?->warning('Redis psubscribe retornó, reconectando...');
-                        $this->safeSleep(1);
-                        $redisSub = $this->redisClient();
-                    }
+                    $this->safeSleep(1);
+                    $this->redis(true);
 
                 } catch (\Exception $e) {
                     if (!$this->isShuttingDown) {
                         $this->logger?->error('Error en Redis subscriber: ' . $e->getMessage());
                         $this->safeSleep(2);
-                        $redisSub = $this->redisClient();
+                        $this->redis(true);
                     }
                 }
             }
-            $redisSub->close();
-            $this->logger?->debug('Redis subscriber finalizado por shutdown');
+            if ($this->redisClient->isConnected()) {
+                $this->redisClient->close();
+                $this->logger?->debug('Redis subscriber finalizado por shutdown');
+            }
         });
     }
+    // END REDIS RELATED METHODS
 
-    /**
-     * Inicia los servicios de Redis después de que el servidor esté corriendo
-     * Debe llamarse después de start() en una corutina separada
-     */
-    public function startRedisServices(): void
-    {
-        if (!$this->isRedisEnabled()) {
-            return;
-        }
-
-        $this->logger?->info("Iniciando servicios Redis en $this->serverId...");
-
-        // Iniciar procesador de mensajes primero
-        $this->startRedisMessageProcessor();
-
-        // Luego iniciar subscriber en corutina separada
-        $this->startRedisSubscriber();
-    }
-
-    /**
-     * Procesa mensajes Redis de forma asincrónica
-     */
-    private function startRedisMessageProcessor(): void
-    {
-        while (!$this->isShuttingDown) {
-            try {
-                // Usar pop con timeout para poder verificar $this->isShuttingDown
-                $message = $this->redisMessageChannel->pop(1.0);
-
-                if ($message === false) {
-                    // Timeout, verificar si debemos continuar
-                    continue;
-                }
-
-                if (isset($message['shutdown'])) {
-                    break;
-                }
-
-                $this->handleRedisMessage($message['channel'], $message['message']);
-
-            } catch (\Throwable $e) {
-                if (!$this->isShuttingDown) {
-                    $this->logger?->error('Error procesando mensaje Redis: ' . $e->getMessage());
-                }
-            }
-        }
-/*
-        $this->logger?->debug('Redis message processor finalizado por shutdown');
-        Coroutine::create(function () {
-            while (true) {
-                $redisMessage = $this->redisMessageChannel->pop();
-                if ($redisMessage === false) {
-                    break; // Canal cerrado
-                }
-
-                try {
-                    $this->handleRedisMessage($redisMessage['channel'], $redisMessage['message']);
-                } catch (\Exception $e) {
-                    $this->logger?->error('Error procesando mensaje Redis: ' . $e->getMessage());
-                }
-            }
-        });*/
-    }
-
-    /**
-     * Maneja mensajes recibidos de Redis
-     */
+    // WS/PUBSUB RELATED METHODS
     private function handleRedisMessage(string $channel, string $message): void
     {
         try {
@@ -738,12 +722,14 @@ class Fluxus extends Server
                 return;
             }
 
-            $channelName = str_replace($this->redisChannelPrefix, '', $channel);
-
+            $channelName = $data['channel'] ?? str_replace($this->redisChannelPrefix . '.', '', $channel);
+            $metadata = $data['_metadata'] ?? [];
             // Solo transmitir si el mensaje no viene de este servidor
-            if (!isset($data['origin_server']) || $data['origin_server'] !== $this->getServerId()) {
+            if (!isset($metadata['origin_server']) || $metadata['origin_server'] !== $this->getServerId()) {
                 $this->broadcastToChannel($channelName, $data);
                 $this->logger?->debug("Mensaje Redis transmitido a canal: $channelName");
+            } else {
+                $this->logger?->debug("Mensaje Redis no transmitido a canal: $channelName (mismo servidor?) [$message]");
             }
 
         } catch (\Exception $e) {
@@ -791,156 +777,6 @@ class Fluxus extends Server
     }
 
     /**
-     * Evento cuando un cliente se conecta
-     */
-    public function handleOpen(Server $server, Request $request): void
-    {
-        $fd = $request->fd;
-        $this->logger?->info("Cliente conectado: FD $fd");
-
-        // Inicializar suscriptor
-        $this->subscribers->set($fd, [
-            'fd' => $fd,
-            'channels' => json_encode([])
-        ]);
-
-        foreach ($this->channels as $channel) {
-            if ($channel['auto_subscribe'] === 1) {
-                try {
-                    $this->subscribeToChannel($fd, $channel['name']);
-                } catch (\Exception $e) {
-                    $this->logger?->error("Error al suscribir al canal {$channel['name']} al cliente $fd: " . $e->getMessage());
-                }
-            }
-        }
-    }
-
-    /**
-     * Evento cuando se recibe un mensaje del cliente
-     */
-    public function handleMessage(Server $server, Frame $frame): void
-    {
-        try {
-            $data = json_decode($frame->data, true);
-            if (!$data || !isset($data['action'])) {
-                $this->sendError($frame->fd, 'Mensaje no válido');
-                return;
-            }
-
-            $this->logger?->debug("Mensaje recibido de FD {$frame->fd}: " . $frame->data);
-
-            $protocol = $this->requestProtocol->getProtocolFor($data);
-            $this->logger?->debug("Protocolo de solicitud: " . get_class($protocol));
-            if ($protocol instanceof RequestHandlerInterface) {
-                $protocol->handle($frame->fd, $this);
-            } else {
-
-                $this->sendError($frame->fd, 'Acción no reconocida: ' . $data['action']);
-                /* switch ($data['action']) {
-                    * case 'subscribe':
-                          $this->handleSubscribe($frame->fd, $data['channel'] ?? '');
-                          break;
-
-                      case 'unsubscribe':
-                          $this->handleUnsubscribe($frame->fd, $data['channel'] ?? '');
-                          break;
-
-                      case 'publish':
-                          $this->handlePublish($frame->fd, $data['channel'] ?? '', $data['data'] ?? null);
-                          break;
-
-                     case 'rpc':
-                         $this->handleRpc($frame->fd, $data);
-                         break;
-                   case 'list_channels':
-                          $this->handleListChannels($frame->fd);
-                          break;
-
-                   case 'list_rpc_methods':
-                          $this->handleListRpcMethods($frame->fd);
-                          break;
-                     case 'authenticate':
-                          $this->handleAuthRequest($frame->fd, $data['token'] ?? '');;
-                          break;
-
-                    default:
-                        $this->sendError($frame->fd, 'Acción no reconocida: ' . $data['action']);
-                }*/
-            }
-        } catch (\Exception $e) {
-            $this->logger?->error('Error procesando mensaje: ' . $e->getMessage());
-            $this->sendError($frame->fd, 'Error interno del servidor');
-        }
-    }
-    /**
-     * Lista métodos RPC disponibles en ESTE worker
-     * private function handleListRpcMethods(int $fd): void
-     * {
-     * $methods = [];
-     * $workerId = $this->getWorkerId();
-     * while ($this->initialized === false) {
-     * $this->logger?->info('Worker #' . $workerId . ' initializing, waiting...');
-     * //usleep(100000);
-     * $this->safeSleep(0.1);
-     * }
-     *
-     * $this->logger?->debug('🗂️ Propiedad rpcHandlers contiene ' . count($this->rpcHandlers) . ' métodos');
-     * $this->logger?->debug('📟 Propiedad rpcMethods contiene ' . $this->rpcMethods->count());
-     * // Listar métodos disponibles en ESTE worker
-     * foreach ($this->rpcHandlers as $methodName => $handler) {
-     * $requiresAuth = false;
-     * $description = $this->getRpcMethodDescription($methodName);
-     * $registeredAt = 0;
-     * $auth_roles = [];
-     *
-     * // Verificar en tabla si existe metadata
-     * if ($this->rpcMethods->exist($methodName)) {
-     * $methodInfo = $this->rpcMethods->get($methodName);
-     * $requiresAuth = (bool)$methodInfo['requires_auth'];
-     * $auth_roles = !empty($methodInfo['allowed_roles']) ? explode(',', $methodInfo['allowed_roles']) : [];
-     * $description = $methodInfo['description'];
-     * $registeredAt = $methodInfo['registered_at'];
-     * if (array_key_exists('only_internal', $methodInfo) && (bool)$methodInfo['only_internal'] === true) {
-     * continue;
-     * }
-     * }
-     *
-     * $methods[] = [
-     * 'name' => $methodName,
-     * 'requires_auth' => $requiresAuth,
-     * 'allowed_roles' => $auth_roles,
-     * 'available_in_worker' => $workerId,
-     * 'description' => $description,
-     * 'registered_at' => $registeredAt
-     * ];
-     * }
-     *
-     * $this->sendToClient($fd, [
-     * 'type' => 'rpc_methods_list',
-     * 'methods' => $methods,
-     * 'total' => count($methods),
-     * 'worker_id' => $workerId,
-     * 'timestamp' => time()
-     * ]);
-     * }
-     */
-    /**
-     * Obtiene descripción de un método RPC
-     */
-    public function getRpcMethodDescription(string $method): string
-    {
-        $descriptions = [
-            'ping' => 'Verifica que el servidor responde',
-            'server.stats' => 'Obtiene estadísticas del servidor',
-            'client.info' => 'Obtiene información del cliente conectado',
-            'math.calculate' => 'Realiza cálculos matemáticos',
-            'worker.info' => 'Obtiene información del worker actual',
-            'channels.list' => 'Lista canales disponibles'
-        ];
-        return $descriptions[$method] ?? 'Método RPC personalizado';
-    }
-
-    /**
      * Maneja suscripción a un canal
      * private function handleSubscribe(int $fd, string $channel): void
      * {
@@ -959,6 +795,10 @@ class Fluxus extends Server
      */
     public function addChannel(string $channel, bool $requireAuth = false, ?string $requireRole = null, bool $autoSubscribe = false): void
     {
+        if (!$this->isRunning()) {
+            $this->channelsQueue[] = [$channel, $requireAuth, $requireRole, $autoSubscribe];
+            return;
+        }
         $this->channels->set($channel, [
             'name' => $channel,
             'auto_subscribe' => $autoSubscribe ? 1 : 0,
@@ -1016,7 +856,8 @@ class Fluxus extends Server
 
         // Agregar canal al cliente
         $subscriber = $this->subscribers->get($fd);
-        $channels = json_decode($subscriber['channels'], true) ?? [];
+        $this->logger?->debug("Suscribiendo FD $fd al canal: $channel. | Existing channels: " . var_export($subscriber, true));
+        $channels = $subscriber ? json_decode($subscriber['channels'], true) : [];
 
         if (!in_array($channel, $channels)) {
             $channels[] = $channel;
@@ -1031,15 +872,6 @@ class Fluxus extends Server
         // NOTA: No necesitamos suscribirnos aquí porque el subscriber general
         // ya está escuchando todos los canales con el patrón 'ws_channel:*'
         // La suscripción en Redis se maneja automáticamente con psubscribe
-    }
-
-    /**
-     * Evento cuando un cliente se desconecta
-     */
-    public function handleClose(Server $server, int $fd): void
-    {
-        $this->logger?->info("Cliente desconectado: FD $fd");
-        $this->cleanupClient($fd);
     }
 
     /**
@@ -1095,7 +927,7 @@ class Fluxus extends Server
         $sentCount = 0;
 
         foreach ($this->subscribers as $subscriber) {
-            $channels = json_decode($subscriber['channels'], true) ?? [];
+            $channels = $subscriber ? json_decode($subscriber['channels'], true) : [];
 
             if (in_array($channel, $channels)) {
                 $fd = $subscriber['fd'];
@@ -1118,7 +950,7 @@ class Fluxus extends Server
     {
         $subscriber = $this->subscribers->get($fd);
         if ($subscriber) {
-            $channels = json_decode($subscriber['channels'], true) ?? [];
+            $channels = $subscriber ? json_decode($subscriber['channels'], true) : [];
 
             foreach ($channels as $channel) {
                 $this->unsubscribeFromChannel($fd, $channel);
@@ -1129,15 +961,65 @@ class Fluxus extends Server
     }
 
     /**
-     * Genera un ID único para este servidor
+     * Evento cuando un cliente se conecta
      */
-    public function getServerId(): string
+    public function handleOpen(Server $server, Request $request): void
     {
-        static $serverId = null;
-        if ($serverId === null) {
-            $serverId = gethostname() . ':' . (getmypid() ?? uniqid());
+        $fd = $request->fd;
+        $this->logger?->info("Cliente conectado: FD $fd");
+
+        // Inicializar suscriptor
+        $this->subscribers->set($fd, [
+            'fd' => $fd,
+            'channels' => json_encode([])
+        ]);
+
+        foreach ($this->channels as $channel) {
+            if ($channel['auto_subscribe'] === 1) {
+                try {
+                    $this->subscribeToChannel($fd, $channel['name']);
+                } catch (\Exception $e) {
+                    $this->logger?->error("Error al suscribir al canal {$channel['name']} al cliente $fd: " . $e->getMessage());
+                }
+            }
         }
-        return $serverId;
+    }
+
+    /**
+     * Evento cuando un cliente se desconecta
+     */
+    public function handleClose(Server $server, int $fd): void
+    {
+        $this->logger?->info("Cliente desconectado: FD $fd");
+        $this->cleanupClient($fd);
+    }
+
+    /**
+     * Evento cuando se recibe un mensaje del cliente
+     */
+    public function handleMessage(Server $server, Frame $frame): void
+    {
+        try {
+            $data = json_decode($frame->data, true);
+            if (!$data || !isset($data['action'])) {
+                $this->sendError($frame->fd, 'Mensaje no válido');
+                return;
+            }
+
+            $this->logger?->debug("Mensaje recibido de FD {$frame->fd}: " . $frame->data);
+
+            $protocol = $this->requestProtocol->getProtocolFor($data);
+            $this->logger?->debug("Protocolo de solicitud: " . get_class($protocol));
+            if ($protocol instanceof RequestHandlerInterface) {
+                $protocol->handle($frame->fd, $this);
+            } else {
+
+                $this->sendError($frame->fd, 'Acción no reconocida: ' . $data['action']);
+            }
+        } catch (\Exception $e) {
+            $this->logger?->error('Error procesando mensaje: ' . $e->getMessage());
+            $this->sendError($frame->fd, 'Error interno del servidor');
+        }
     }
 
     /**
@@ -1183,167 +1065,19 @@ class Fluxus extends Server
             $this->push($fd, json_encode($data));
         }
     }
+    // END WS/PUBSUB RELATED METHODS
 
-    /**
-     * Verifica si una conexión WebSocket está establecida
-     */
-    public function isEstablished(int $fd): bool
+    // RPC RELATED METHODS
+    public function getRpcMethods(): Table
     {
-        try {
-            $info = $this->getClientInfo($fd);
-            return $info && $info['websocket_status'] === WEBSOCKET_STATUS_ACTIVE;
-        } catch (\Exception $e) {
-            return false;
-        }
+        return $this->rpcMethods;
     }
 
-    /**
-     * Obtiene estadísticas del servidor
-     */
-    public function getStats(): array
+    public function getRpcMethod(string $method): callable|null
     {
-        return [
-            'server_id' => $this->getServerId(),
-            'clients' => count($this->connections ?? []),
-            'channels' => $this->channels->count(),
-            'subscribers' => $this->subscribers->count(),
-            'redis_enabled' => $this->isRedisEnabled()
-        ];
+        return $this->rpcMethods->get($method);
     }
 
-    /**
-     * Registra un método RPC (puede ser llamado por múltiples workers)
-     */
-    public function registerRpcMethod(
-        string   $method,
-        callable $handler,
-        bool     $requires_auth = false,
-        array    $allowed_roles = ['ws:general'],
-        string   $description = '',
-        bool     $only_internal = false
-    ): bool
-    {
-        $workerId = $this->getWorkerId();
-
-        // Verificar solo si YA ESTÁ REGISTRADO EN ESTE WORKER
-        if (isset($this->rpcHandlers[$method])) {
-            $this->logger?->debug("Método $method ya registrado en worker #$workerId");
-            return false;
-        }
-
-        // Guardar handler en ESTE worker
-        $this->rpcHandlers[$method] = $handler;
-        $roles = !empty($allowed_roles) ? implode('|', $allowed_roles) : [];
-        // Solo el primer worker que encuentre el método vacío en la tabla lo registra
-        if (!$this->rpcMethods->exist($method)) {
-            $this->rpcMethods->set($method, [
-                'name' => $method,
-                'description' => $description,
-                'requires_auth' => $requires_auth ? 1 : 0,
-                'allowed_roles' => $roles,
-                'registered_by_worker' => $workerId,
-                'only_internal' => $only_internal ? 1 : 0,
-                'registered_at' => time()
-            ]);
-            $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method");
-        } else {
-            $this->logger?->debug("📝 Método $method ya en tabla, solo registrando handler en worker #$workerId");
-        }
-
-        return true;
-    }
-
-    public function registerRpcMethods(MethodsCollection $collection): void
-    {
-        foreach ($collection as $method) {
-            $this->registerRpcMethod(...$method->toArray());
-        }
-    }
-
-    /**
-     * Obtiene uptime del servidor
-     */
-    public function getUptime(): string
-    {
-        if (!isset($this->startTime)) {
-            $this->startTime = time();
-        }
-
-        $uptime = time() - $this->startTime;
-        $hours = floor($uptime / 3600);
-        $minutes = floor(($uptime % 3600) / 60);
-        $seconds = $uptime % 60;
-
-        return sprintf("%02d:%02d:%02d", $hours, $minutes, $seconds);
-    }
-
-    /**
-     * Ejecuta un método RPC en una corutina
-     */
-    public function executeRpcMethod(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
-    {
-        try {
-            $this->logger?->debug("▶️  Ejecutando RPC en worker #{$workerId}: $method (ID: $requestId)");
-            // Verificar que el método existe
-            if (!isset($this->rpcHandlers[$method])) {
-                $this->logger?->error("💥 Método desapareció durante ejecución en worker #{$workerId}: $method");
-                $this->sendRpcError($fd, $requestId, "Error interno: método no disponible", 500);
-                $this->updateRpcRequest($requestId, 'failed');
-                return;
-            }
-
-            // Actualizar estado a procesando
-            $this->updateRpcRequest($requestId, 'processing');
-
-            $startTime = microtime(true);
-            $handler = $this->rpcHandlers[$method];
-
-            try {
-                // Ejecutar handler
-                $result = $handler($this, $params, $fd);
-                $executionTime = round((microtime(true) - $startTime) * 1000, 2);
-                // Agregar metadata al resultado
-                if (is_array($result)) {
-                    if (!isset($result['_metadata'])) {
-                        $result['_metadata'] = [];
-                    }
-                    $result['_metadata'] = array_merge($result ['_metadata'], [
-                        'execution_time_ms' => $executionTime,
-                        'worker_id' => $workerId,
-                        'request_id' => $requestId
-                    ]);
-                }
-
-                // Enviar resultado
-                $this->sendRpcResult($fd, $requestId, $result, $executionTime);
-                $this->updateRpcRequest($requestId, 'completed');
-
-                $this->logger?->debug("✅ RPC completado en worker #{$workerId}: $method en {$executionTime}ms");
-
-            } catch (\Exception $e) {
-                $this->logger?->error("❌ Error ejecutando RPC en worker #{$workerId}: " . $e->getMessage());
-                $this->sendRpcError($fd, $requestId, $e->getMessage());
-                $this->updateRpcRequest($requestId, 'failed');
-            }
-
-        } catch (\Exception $e) {
-            $this->logger?->error("💥 Error crítico en RPC worker #{$workerId}: " . $e->getMessage());
-            $this->sendRpcError($fd, $requestId, 'Error interno del servidor');
-            $this->updateRpcRequest($requestId, 'failed');
-        }
-    }
-
-
-    /**
-     * Maneja errores de RPC
-     *
-     * private function handleRpcError(int $fd, string $requestId, string $method, \Exception $e): void
-     * {
-     * $this->logger?->error("Error ejecutando RPC $method: " . $e->getMessage());
-     * $this->sendRpcError($fd, $requestId, $e->getMessage());
-     * $this->updateRpcRequest($requestId, 'failed');
-     * }
-     */
     /**
      * Envía resultado RPC al cliente
      */
@@ -1403,7 +1137,7 @@ class Fluxus extends Server
      */
     public function generateRpcId(): string
     {
-        return 'rpc_' . uniqid() . '_' . (++$this->rpcRequestCounter);
+        return uniqid('rpc_', false) . '_' . (++$this->rpcRequestCounter);
     }
 
 
@@ -1580,20 +1314,149 @@ class Fluxus extends Server
         $task->finish("Task completed");
     }
 
-    public function currentRoles(): array
+    /**
+     * Ejecuta un método RPC en una corutina
+     */
+    public function executeRpcMethod(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
     {
-        $roles = [];
-        foreach ($this->channels as $channel) {
-            $roles[] = $channel['requires_role'];
-        }
-        $rpcRoles = [];
-        foreach ($this->rpcMethods as $method) {
-            $rpcRoles[] = !empty($method['allowed_roles']) ? explode('|', $method['allowed_roles']) : ['ws:general', 'ws:user'];;
-        }
+        try {
+            $this->logger?->debug("▶️  Ejecutando RPC en worker #{$workerId}: $method (ID: $requestId)");
+            // Verificar que el método existe
+            if (!isset($this->rpcHandlers[$method])) {
+                $this->logger?->error("💥 Método desapareció durante ejecución en worker #{$workerId}: $method");
+                $this->sendRpcError($fd, $requestId, "Error interno: método no disponible", 500);
+                $this->updateRpcRequest($requestId, 'failed');
+                return;
+            }
 
-        return array_unique(array_filter(array_merge($roles, ...$rpcRoles)));
+            // Actualizar estado a procesando
+            $this->updateRpcRequest($requestId, 'processing');
+
+            $startTime = microtime(true);
+            $handler = $this->rpcHandlers[$method];
+
+            try {
+                // Ejecutar handler
+                $result = $handler($this, $params, $fd);
+                $executionTime = round((microtime(true) - $startTime) * 1000, 2);
+                // Agregar metadata al resultado
+                if (is_array($result)) {
+                    if (!isset($result['_metadata'])) {
+                        $result['_metadata'] = [];
+                    }
+                    $result['_metadata'] = array_merge($result ['_metadata'], [
+                        'execution_time_ms' => $executionTime,
+                        'worker_id' => $workerId,
+                        'request_id' => $requestId
+                    ]);
+                }
+
+                // Enviar resultado
+                $this->sendRpcResult($fd, $requestId, $result, $executionTime);
+                $this->updateRpcRequest($requestId, 'completed');
+
+                $this->logger?->debug("✅ RPC completado en worker #{$workerId}: $method en {$executionTime}ms");
+
+            } catch (\Exception $e) {
+                $this->logger?->error("❌ Error ejecutando RPC en worker #{$workerId}: " . $e->getMessage());
+                $this->sendRpcError($fd, $requestId, $e->getMessage());
+                $this->updateRpcRequest($requestId, 'failed');
+            }
+
+        } catch (\Exception $e) {
+            $this->logger?->error("💥 Error crítico en RPC worker #{$workerId}: " . $e->getMessage());
+            $this->sendRpcError($fd, $requestId, 'Error interno del servidor');
+            $this->updateRpcRequest($requestId, 'failed');
+        }
     }
 
+    /**
+     * Registra un método RPC (puede ser llamado por múltiples workers)
+     */
+    public function registerRpcMethod(
+        string   $method,
+        callable $handler,
+        bool     $requires_auth = false,
+        array    $allowed_roles = ['ws:general'],
+        string   $description = '',
+        bool     $only_internal = false
+    ): bool
+    {
+        $workerId = $this->getWorkerId();
+        if (!isset($this->rpcHandlers)) {
+            $this->rpcHandlers = [];
+        }
+        if (!isset($this->rpcMethods)) {
+            $this->rpcMethodsQueue[] = func_get_args();
+            return true;
+        }
+
+        // Verificar solo si YA ESTÁ REGISTRADO EN ESTE WORKER
+        if (isset($this->rpcHandlers[$method])) {
+            $this->logger?->debug("Método $method ya registrado en worker #$workerId");
+            return false;
+        }
+
+        // Guardar handler en ESTE worker
+        $this->rpcHandlers[$method] = $handler;
+        $roles = !empty($allowed_roles) ? implode('|', $allowed_roles) : [];
+        // Solo el primer worker que encuentre el método vacío en la tabla lo registra
+        if (!$this->rpcMethods->exist($method)) {
+            $this->rpcMethods->set($method, [
+                'name' => $method,
+                'description' => $description,
+                'requires_auth' => $requires_auth ? 1 : 0,
+                'allowed_roles' => $roles,
+                'registered_by_worker' => $workerId,
+                'only_internal' => $only_internal ? 1 : 0,
+                'registered_at' => time()
+            ]);
+            $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method");
+        } else {
+            $this->logger?->debug("📝 Método $method ya en tabla, solo registrando handler en worker #$workerId");
+        }
+
+        return true;
+    }
+
+    public function registerRpcMethods(MethodsCollection $collection): void
+    {
+        foreach ($collection as $method) {
+            $this->registerRpcMethod(...$method->toArray());
+        }
+    }
+
+    public function registerInternalRpcProcessor(string $processorName, RpcInternalPorcessorInterface $processor): void
+    {
+        if (isset($this->rpcInternalProcessors[$processorName]) && $this->rpcInternalProcessors[$processorName] === $processor) {
+            $this->logger?->warning('Processor ' . $processorName . ' already registered as internal RPC processor. Skipping...');
+            return;
+        }
+        if ($this->isRunning()) {
+            $processor->init($this);
+        }
+        $this->rpcInternalProcessors[$processorName] = $processor;
+    }
+
+    public function getInternalRpcProcessor(string $processorName): ?RpcInternalPorcessorInterface
+    {
+        return $this->rpcInternalProcessors[$processorName] ?? null;
+    }
+
+    public function listInternalRpcProcessors(): array
+    {
+        return array_keys($this->rpcInternalProcessors);
+    }
+
+    private function initializeRpcInternalProcessors(): void
+    {
+        foreach ($this->rpcInternalProcessors as $processor) {
+            $processor->init($this);
+        }
+    }
+    // END RPC RELATED METHODS
+
+    // AUTH RELATED METHODS
     /**
      * Verifica si un cliente está autenticado
      */
@@ -1606,4 +1469,6 @@ class Fluxus extends Server
     {
         return $this->auth?->getRoles($fd);
     }
+    // END AUTH RELATED METHODS
+
 }

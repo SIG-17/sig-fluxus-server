@@ -33,13 +33,15 @@ class Rpc extends Base implements RequestHandlerInterface
 
         $requestId = $this->id ?? $server->generateRpcId();
         $method = $this->method ?? '';
-        $params = $this->params instanceof AbstractDescriptor ? $this->params?->getInitialized() : [];
+
+        $server->logger?->debug('Received PARAMS '.__FILE__.' '.__LINE__.' '.print_r($this->params, true));
+        $params = $this->params instanceof AbstractDescriptor ? $this->params?->getInitialized() : $this->params;
         $timeout = isset($this->timeout) ? (int)$this->timeout : 30;
         $workerId = $server->getWorkerId();
-        while ($server->initialized === false) {
+        while ($server->isRunning() === false) {
             $server->logger?->info('Worker #' . $workerId . ' initializing, waiting...');
             //usleep(100000);
-            $server->safeSleep(0.1);
+            $server->safeSleep(0.5);
         }
         try {
             if (empty($method)) {
@@ -62,8 +64,8 @@ class Rpc extends Base implements RequestHandlerInterface
 
             // Verificar en tabla para metadata
             $requiresAuth = false;
-            if ($server->rpcMethods->exist($method)) {
-                $methodInfo = $server->rpcMethods->get($method);
+            if ($server->getRpcMethods()->exist($method)) {
+                $methodInfo = $server->getRpcMethods()->get($method);
                 $requiresAuth = (bool)$methodInfo['requires_auth'];
             }
 

@@ -26,9 +26,9 @@ class DbProcessor implements RpcInternalPorcessorInterface
     /**
      * @param Connector $connector
      * @param DbConfigCollection $poolCollection
-     * @param LoaderInterface $loader
+     * @param LoaderStorageInterface $loaderStorage
      * @param LoggerInterface|null $logger
-     * @throws InvalidArgumentException
+     * @param LoggerInterface|null $db_logger
      */
     public function __construct(
         public Connector                  $connector,
@@ -263,5 +263,12 @@ class DbProcessor implements RpcInternalPorcessorInterface
         } catch (Throwable $e) {
             $this->logger?->error('Error inicializando DB Processor: ' . $e->getMessage());
         }
+    }
+
+    public function deInit(?Fluxus $server): void
+    {
+        $logger = $server->logger ?? $this->logger;
+        $logger?->info('Closing ALL DB Processor connections...');
+        $this->connector->closeAllPools();
     }
 }

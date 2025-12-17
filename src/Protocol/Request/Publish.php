@@ -69,7 +69,7 @@ class Publish extends Base implements RequestHandlerInterface
         // Publicar en Redis para otros servidores (solo si hay suscriptores en otros lados)
         if ($server->isRedisEnabled()) {
             try {
-                $count = $server->redis->publish("$server->redisChannelPrefix.$this->channel", json_encode($message));
+                $count = $server->redis()->publish("$server->redisChannelPrefix.$this->channel", json_encode($message));
                 if ($count === false) {
                     $server->logger?->warning("No se pudo publicar en Redis: $this->channel");
                 } else {
