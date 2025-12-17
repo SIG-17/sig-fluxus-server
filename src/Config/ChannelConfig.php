@@ -20,4 +20,6 @@ class ChannelConfig extends AbstractDescriptor
         }
     }
 
+    protected(set) bool $persists_on_empty = false;
+
 }

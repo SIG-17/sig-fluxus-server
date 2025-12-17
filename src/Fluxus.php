@@ -26,6 +26,13 @@ use Tabula17\Satelles\Utilis\Config\RedisConfig;
 use Tabula17\Satelles\Utilis\Config\TCPServerConfig;
 use Tabula17\Satelles\Utilis\Trait\CoroutineHelper;
 
+/**
+ * Class Fluxus
+ *
+ * Extends the Server class, integrating features for handling events, Pub/Sub mechanisms, and managing hooks.
+ * Implements a variety of event management methods, table initializations for subscribers and channels,
+ * and custom event hooks for different triggers.
+ */
 class Fluxus extends Server
 {
     use CoroutineHelper;
@@ -69,8 +76,8 @@ class Fluxus extends Server
         'pipeMessage',
         'task',
         //'finish',
-         'workerStart',
-        //'workerStop',
+        'workerStart',
+        'workerStop',
     ];
     private array $hookableEvents = [
         'start' => ['before', 'after'],
@@ -111,6 +118,10 @@ class Fluxus extends Server
     private array $rpcRequestsQueue = [];
 
     private array $channelsQueue = [];
+    /**
+     * @var true
+     */
+    private bool $signalsConfigured = false;
 
     public function __construct(
         TCPServerConfig                  $config,
@@ -130,6 +141,7 @@ class Fluxus extends Server
         }
         $this->set($options);
         $this->setupPrivateEvents();
+        $this->setupSignals();
     }
 
     // EVENT MANAGEMENT RELATED METHODS
@@ -260,6 +272,7 @@ class Fluxus extends Server
         $this->channels->column('last_message_fd', Table::TYPE_INT);
         $this->channels->column('requires_auth', Table::TYPE_INT, 1);
         $this->channels->column('requires_role', Table::TYPE_STRING, 255);
+        $this->channels->column('persists_on_empty', Table::TYPE_INT, 1);
         $this->channels->create();
         while ($arguments = array_shift($this->channelsQueue)) {
             $this->addChannel(...$arguments);
@@ -301,6 +314,47 @@ class Fluxus extends Server
         $this->initializeRpcInternalProcessors();
     }
 
+    private function setupSignals(): void
+    {
+        if ($this->signalsConfigured || !extension_loaded('pcntl')) {
+            return;
+        }
+
+        $this->logger?->info('🔧 Configurando handlers de señales...');
+
+        // Solo el proceso maestro debe configurar señales
+        pcntl_async_signals(true);
+
+        // SIGTERM - Shutdown graceful
+        pcntl_signal(SIGTERM, function (int $signo) {
+            $this->logger?->info("📡 Señal SIGTERM recibida, iniciando shutdown...");
+            $this->shutdownOnSignal($signo);
+        });
+
+        // SIGINT - Ctrl+C
+        pcntl_signal(SIGINT, function (int $signo) {
+            $this->logger?->info("📡 Señal SIGINT (Ctrl+C) recibida, iniciando shutdown...");
+            $this->shutdownOnSignal($signo);
+        });
+
+        // SIGUSR1 - Reload
+        pcntl_signal(SIGUSR1, function (int $signo) {
+            $this->logger?->info("🔄 Señal SIGUSR1 recibida, recargando workers...");
+            $this->reload();
+        });
+
+        $this->signalsConfigured = true;
+        $this->logger?->info('✅ Handlers de señales configurados');
+    }
+
+    private function initializeServices(): void
+    {
+        $this->logger?->debug('Inicializando servicios...');
+        $this->startRedisServices();
+        $this->initializeRpcInternalProcessors();
+        $this->runEventActions('start', [], 'after');
+    }
+
     private function setupPrivateEvents(): void
     {
 
@@ -316,20 +370,15 @@ class Fluxus extends Server
         $this->onPrivateEvent('workerStart', function () {
             $this->initializeOnWorkers($this, $this->getWorkerId());
         });
+        $this->onPrivateEvent('workerStop', function () {
+            $this->cleanUpRpcProcessors();
+        });
         $this->onPrivateEvent('open', [$this, 'handleOpen']);
         $this->onPrivateEvent('message', [$this, 'handleMessage']);
         $this->onPrivateEvent('close', [$this, 'handleClose']);
         $this->onPrivateEvent('request', [$this, 'handleRequest']);
         $this->onPrivateEvent('pipeMessage', [$this, 'handlePipeMessage']);
         $this->onPrivateEvent('task', [$this, 'handleTask']);;
-    }
-
-    private function initializeServices(): void
-    {
-        $this->logger?->debug('Inicializando servicios...');
-        $this->startRedisServices();
-        $this->initializeRpcInternalProcessors();
-        $this->runEventActions('start', [], 'after');
     }
 
     // END SETUP AND INIT RELATED METHODS
@@ -380,6 +429,20 @@ class Fluxus extends Server
         $this->logger?->info('Servidor detenido');
         $this->runEventActions('shutdown', [], 'after');
         return $shutdown;
+    }
+
+    private function shutdownOnSignal(int $signal): void
+    {
+        static $handled = false;
+
+        if ($handled || $this->isShuttingDown) {
+            $this->logger?->info('Shutdown ya en progreso, ignorando señal...');
+            return;
+        }
+
+        $handled = true;
+        $this->logger?->info("Recibido signal {$signal}, cerrando servidor...");
+        $this->shutdown();
     }
 
     public function pause(int $fd): bool
@@ -468,11 +531,12 @@ class Fluxus extends Server
 
         return sprintf("%02d:%02d:%02d", $hours, $minutes, $seconds);
     }
+
     private function cleanUpRpcProcessors(string $logPrefix = '🛑'): void
     {
         $this->logger?->debug("$logPrefix Limpiando procesadores RPC...");
         foreach ($this->rpcInternalProcessors as $processor) {
-            if($processor instanceof RpcInternalPorcessorInterface) {
+            if ($processor instanceof RpcInternalPorcessorInterface) {
                 $processor->deInit($this);
             }
         }
@@ -793,7 +857,7 @@ class Fluxus extends Server
      * }
      * }
      */
-    public function addChannel(string $channel, bool $requireAuth = false, ?string $requireRole = null, bool $autoSubscribe = false): void
+    public function addChannel(string $channel, bool $requireAuth = false, ?string $requireRole = null, bool $autoSubscribe = false, bool $persists = false): void
     {
         if (!$this->isRunning()) {
             $this->channelsQueue[] = [$channel, $requireAuth, $requireRole, $autoSubscribe];
@@ -805,7 +869,8 @@ class Fluxus extends Server
             'subscriber_count' => 0,
             'created_at' => time(),
             'requires_auth' => $requireAuth ? 1 : 0,
-            'requires_role' => $requireRole
+            'requires_role' => $requireRole,
+            'persists_on_empty' => $persists ? 1 : 0,
         ]);
         if ($autoSubscribe) {
             foreach ($this->connections as $fd) {
@@ -851,6 +916,7 @@ class Fluxus extends Server
             'last_message_fd' => $channelInfo['last_message_fd'] ?? null,
             'requires_auth' => $channelInfo['requires_auth'] ?? false,
             'requires_role' => $channelInfo['requires_role'] ?? null,
+            'persists_on_empty' => $channelInfo['persists_on_empty'] ?? false,
 
         ]);
 
@@ -896,10 +962,10 @@ class Fluxus extends Server
             $channelInfo = $this->channels->get($channel);
             $newCount = max(0, $channelInfo['subscriber_count'] - 1);
 
-            if ($newCount === 0) {
+            if ($newCount === 0 && !($channelInfo['persists_on_empty'] ?? 0)) {
                 // Eliminar canal si no hay suscriptores
                 $this->channels->del($channel);
-                $this->logger?->info("Canal eliminado: $channel");
+                $this->logger?->info("Canal eliminado: $channel (poe: {$channelInfo['persists_on_empty']})");
             } else {
                 $this->channels->set($channel, [
                     'name' => $channel,
@@ -909,7 +975,8 @@ class Fluxus extends Server
                     'last_message_at' => $channelInfo['last_message_at'],
                     'last_message_fd' => $channelInfo['last_message_fd'],
                     'requires_auth' => $channelInfo['requires_auth'],
-                    'requires_role' => $channelInfo['requires_role']
+                    'requires_role' => $channelInfo['requires_role'],
+                    'persists_on_empty' => $channelInfo['persists_on_empty'],
                 ]);
             }
         }

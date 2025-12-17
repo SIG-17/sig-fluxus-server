@@ -240,14 +240,12 @@ try {
     // Handler RPC para shutdown
     $server->registerRpcMethod('ws.shutdown', function (Fluxus $server, $data, $fd) use ($logger) {
         $logger->info("Shutdown solicitado via RPC desde FD $fd");
-/*
-        if ($server->isShuttingDown) {
+        if (!$server->isRunning()) {
             return [
                     'status' => 'already_in_progress',
                     'message' => 'Shutdown ya en progreso'
             ];
-        }*/
-
+        }
         // Enviar respuesta inmediata al cliente
         $response = $server->responseProtocol->getProtocolFor([
                 'type' => $server->responseProtocol->get('success'),
@@ -468,6 +466,7 @@ try {
                                     requireAuth: $channel->required_auth ?? false,
                                     requireRole: $channel->required_role ?? null,
                                     autoSubscribe: $channel->auto_subscribe ?? false,
+                                    persists: $channel->persists_on_empty ?? false,
                             );
                         }
                     }
