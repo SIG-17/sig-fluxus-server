@@ -118,8 +118,11 @@ class Fluxus extends Server
     private array $rpcRequestsQueue = [];
 
     private array $channelsQueue = [];
+
+    public array $collectResponses = [];
+    public array $collectChannels = [];
     /**
-     * @var true
+     * @var bool $signalsConfigured
      */
     private bool $signalsConfigured = false;
 
@@ -578,6 +581,8 @@ class Fluxus extends Server
         $workerId = $this->getWorkerId();
         $this->logger?->info("🧹 #$workerId Limpiando recursos...");
         $this->stopRedisServices("🧹");
+        $this->cleanUpPubSub("🧹");
+        $this->cleanUpRpcProcessors("🧹");
         //foreach ($this->cancelableCids as $cid) {
         while ($cid = array_shift($this->cancelableCids)) {
             if (Coroutine::exists($cid)) {
@@ -585,8 +590,6 @@ class Fluxus extends Server
                 Coroutine::cancel($cid);
             }
         }
-        $this->cleanUpPubSub("🧹");
-        $this->cleanUpRpcProcessors("🧹");
         $this->cleanUpRpcTables();
         $this->logger?->info("🧹 #$workerId Recursos limpiados");
     }
@@ -1032,6 +1035,9 @@ class Fluxus extends Server
      */
     public function handleOpen(Server $server, Request $request): void
     {
+        if ($this->isShuttingDown) {
+            return;
+        }
         $fd = $request->fd;
         $this->logger?->info("Cliente conectado: FD $fd");
 

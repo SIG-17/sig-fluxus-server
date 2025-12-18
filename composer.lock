@@ -169,12 +169,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/mongodb/mongo-php-library.git",
-                "reference": "0a2472ba9cbb932f7e43a8770aedb2fc30612a67"
+                "reference": "d6add3e36476f4aebf208a1c5f7a2df5d8dfe083"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/mongodb/mongo-php-library/zipball/0a2472ba9cbb932f7e43a8770aedb2fc30612a67",
-                "reference": "0a2472ba9cbb932f7e43a8770aedb2fc30612a67",
+                "url": "https://api.github.com/repos/mongodb/mongo-php-library/zipball/d6add3e36476f4aebf208a1c5f7a2df5d8dfe083",
+                "reference": "d6add3e36476f4aebf208a1c5f7a2df5d8dfe083",
                 "shasum": ""
             },
             "require": {
@@ -238,7 +238,7 @@
                 "issues": "https://github.com/mongodb/mongo-php-library/issues",
                 "source": "https://github.com/mongodb/mongo-php-library/tree/v2.1"
             },
-            "time": "2025-10-06T12:12:40+00:00"
+            "time": "2025-12-18T10:32:55+00:00"
         },
         {
             "name": "monolog/monolog",
@@ -698,12 +698,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/Tabula17/satelles-utilis-proelio.git",
-                "reference": "2231759b94ef8156ae8a1756810a8df18a332094"
+                "reference": "b6eeb6ad684cbd59ad02d09667f630a4feb64079"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/Tabula17/satelles-utilis-proelio/zipball/2231759b94ef8156ae8a1756810a8df18a332094",
-                "reference": "2231759b94ef8156ae8a1756810a8df18a332094",
+                "url": "https://api.github.com/repos/Tabula17/satelles-utilis-proelio/zipball/b6eeb6ad684cbd59ad02d09667f630a4feb64079",
+                "reference": "b6eeb6ad684cbd59ad02d09667f630a4feb64079",
                 "shasum": "",
                 "mirrors": [
                     {
@@ -759,7 +759,7 @@
                 "source": "https://github.com/Tabula17/satelles-utilis-proelio/tree/main",
                 "issues": "https://github.com/Tabula17/satelles-utilis-proelio/issues"
             },
-            "time": "2025-12-14T19:02:19+00:00"
+            "time": "2025-12-18T14:17:09+00:00"
         }
     ],
     "packages-dev": [
@@ -802,12 +802,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/Tabula17/satelles-omnia-roga.git",
-                "reference": "0dc94af1de4a9f865f3cfcc29946876f1d652bef"
+                "reference": "f42af4f05d4590cf8a160ab8ba67b0c6d6080f16"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/Tabula17/satelles-omnia-roga/zipball/0dc94af1de4a9f865f3cfcc29946876f1d652bef",
-                "reference": "0dc94af1de4a9f865f3cfcc29946876f1d652bef",
+                "url": "https://api.github.com/repos/Tabula17/satelles-omnia-roga/zipball/f42af4f05d4590cf8a160ab8ba67b0c6d6080f16",
+                "reference": "f42af4f05d4590cf8a160ab8ba67b0c6d6080f16",
                 "shasum": "",
                 "mirrors": [
                     {
@@ -868,7 +868,7 @@
                 "source": "https://github.com/Tabula17/satelles-omnia-roga/tree/main",
                 "issues": "https://github.com/Tabula17/satelles-omnia-roga/issues"
             },
-            "time": "2025-12-17T19:33:04+00:00"
+            "time": "2025-12-18T15:09:10+00:00"
         }
     ],
     "aliases": [],

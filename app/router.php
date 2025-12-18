@@ -122,37 +122,22 @@ $loaderStorage = new XmlStatements(
         logger: $logger
 );
 
+$healthManager = new HealthManager(
+        connector: $connector,
+        checkInterval: 30000, // 30 segundos
+        logger: $logger
+);
 $db = new DbProcessor(
         connector: $connector,
         poolCollection: $poolCollection,
         loaderStorage: $loaderStorage,
         logger: $logger,
-        db_logger: $db_logger
+        db_logger: $db_logger,
+        healthManager: $healthManager
 );
 
 
-$healthManager = null; /*new HealthManager(
-        connector: $db->connector,
-        checkInterval: 30000, // 30 segundos
-        logger: $logger
-);*/
-
 $auth = new FakeAuth();
-
-function handle_shutdown(LoggerInterface $logger, HealthManager $healthManager, Connector $connector): void
-{
-    static $handled = false;
-    if ($handled) {
-        return;
-    }
-    $handled = true;
-    $connector->closeAllPools();
-    $logger->info("🛑 Shutdown signal recibido");
-    $healthManager?->stopGracefully();
-    // $server?->shutdown();
-    // Aquí puedes agregar limpieza personalizada si es necesaria
-    $logger->info("✅ Limpieza completada");
-}
 
 //<-- DB MANAGER
 try {
@@ -180,35 +165,6 @@ try {
 
     if (!empty($override)) {
         $wsConfig[$instance]->loadProperties($override);
-    }
-    // Configurar manejadores de señales globales
-    if (extension_loaded('pcntl')) {
-        declare(ticks=1);
-
-        /*pcntl_signal(SIGINT, function() use ($server, $logger) {
-            $logger->info("SIGINT recibido, iniciando shutdown...");
-            if (isset($server) && $server instanceof Ws) {
-               // $server->gracefulShutdown();
-                $server->shutdown();
-            }
-            exit(0);
-        });
-
-        pcntl_signal(SIGTERM, function() use ($server, $logger) {
-            $logger->info("SIGTERM recibido, iniciando shutdown...");
-            if (isset($server) && $server instanceof Ws) {
-               // $server->gracefulShutdown();
-                $server->shutdown();
-            }
-            exit(0);
-        });
-
-        pcntl_signal(SIGHUP, function() use ($server, $logger) {
-            $logger->info("SIGHUP recibido, recargando...");
-            if (isset($server) && $server instanceof Ws) {
-                $server->reload();
-            }
-        });*/
     }
     $server = new Fluxus(
             config: $wsConfig[$instance],
@@ -366,7 +322,7 @@ try {
                 $localResult = [];
                 try {
                     // $localResult = $server->rpcHandlers['db.failures.retry']([], $fd);
-                    $localResult = $healthManager->retryPermanentFailures($workerId);
+                    $localResult = $healthManager->performHealthChecks($workerId, true);
                     $logger->info("✅ Reconexión ejecutada localmente en worker #{$workerId}");
                 } catch (\Exception $e) {
                     $logger->error("❌ Error en reconexión local: " . $e->getMessage());
@@ -415,12 +371,20 @@ try {
     );
     $server->registerRpcMethod(
             method: 'db.failures.retry',
-            handler: function ($server, $params, $fd) use ($healthManager, $logger) {
+            handler: function ($server, $params, $fd) use ($logger) {
+
+                /**
+                 * @var DbProcessor $processor
+                 */
+                $processor = $server->getInternalRpcProcessor('db');
+                $healthManager = $processor->healthManager;
+
+
                 $logger->info("Forcing retry permanent db failures from client {$fd}");
                 return [
                         'status' => 'ok',
                         'message' => 'Health check executed',
-                        'results' => $healthManager->retryPermanentFailures($server->getWorkerId()),
+                        'results' => $healthManager->performHealthChecks($server->getWorkerId(), true),
                         'timestamp' => time()
                 ];
             },
@@ -429,16 +393,41 @@ try {
             description: 'Forces retry of permanent failures in the database connection pool',
             only_internal: true
     );
-    $server->registerRpcMethod('health.status', function ($server, $params, $fd) use ($healthManager) {
+    $server->registerRpcMethod('db.health.status', function ($server, $params, $fd) use ($healthManager) {
+        /**
+         * @var DbProcessor $processor
+         */
+        $processor = $server->getInternalRpcProcessor('db');
+        $wHealthManager = $processor->healthManager;
         return [
                 'status' => 'ok',
                 'health' => $healthManager->getHealthStatus(),
+                'health_worker' => $wHealthManager->getHealthStatus(),
                 'timestamp' => time(),
                 'worker_id' => $server->getWorkerId()
         ];
     });
-    $server->registerRpcMethod('health.check.now', function ($server, $params, $fd) use ($healthManager, $logger) {
+    $server->registerRpcMethod('db.health.history', function (Fluxus $server, $params, $fd) {
+        /**
+         * @var DbProcessor $processor
+         */
+        $processor = $server->getInternalRpcProcessor('db');
+        $healthManager = $processor->healthManager;
+        return [
+                'status' => 'ok',
+                'health' => $healthManager->getCheckHistory(), //$healthManager->getCheckHistory(),
+                'timestamp' => time(),
+                'worker_id' => $server->getWorkerId()
+        ];
+    });
+
+    $server->registerRpcMethod('db.health.check.now', function ($server, $params, $fd) use ($logger) {
         $logger->info("Forcing health check from client {$fd}");
+        /**
+         * @var DbProcessor $processor
+         */
+        $processor = $server->getInternalRpcProcessor('db');
+        $healthManager = $processor->healthManager;
         // Ejecutar check inmediato
         $healthManager->performHealthChecks($server->getWorkerId());
         return [
@@ -474,44 +463,6 @@ try {
             }
         }
     });
-    // **OPCIONAL: Callback para cuando se inicia el servidor**
-   /* $server->on('start', function (Fluxus $server) use ($logger) {
-        $logger->debug("📡 Servidor WebSocket ejecutándose...");
-        foreach ($server->getStats() as $stat => $value) {
-            $logger->debug("🚼 {$stat}: " . var_export($value, true));
-        }
-        // Aquí puedes iniciar servicios adicionales que necesiten correr después del start
-        // Pero NO registres señales aquí
-    });*/
-    // **OPCIONAL: Callback para worker start (si usas modo process)**
-    $server->onBefore('workerStart', function (Fluxus $server, int $workerId) use ($logger) {
-        $logger->info("👷 Worker #{$workerId} iniciando PID: {$server->getWorkerPid($workerId)}");
-    });
-    $server->onAfter('workerStart', function (Fluxus $server, int $workerId) use ($logger, $healthManager) {
-        $logger->debug("👷 --> Worker #{$workerId} status: " . $server->getWorkerStatus($workerId));
-        // Solo workers principales (no task workers)
-        if ($workerId < $server->setting['worker_num']) {
-            // Iniciar health checks con escalonamiento automático
-            //  $healthManager->setupServerTick($server, $workerId);
-        }
-    });
-
-    $server->onBefore('workerStop', function (Fluxus $server, int $workerId) use ($logger, $connector) {
-        $logger->debug("Worker #{$workerId} deteniéndose...");
-
-        // Solo workers de aplicación (no task workers)
-//        if ($workerId < $server->setting['worker_num']) {
-//            $logger->debug('🔐 Worker #' . $workerId . ' Closing database connections...');
-//            $connector->closeAllPools();
-//        }
-
-        $logger->info("🙅🏼‍♂️ Worker #$workerId finalizado");
-    });
-
-    $server->onAfter('workerStop', function (Fluxus $server, int $workerId) use ($logger) {
-        $logger->debug("🙅🏼‍♂️ Worker #{$workerId} finalizado");
-    });
-
 
     $server->onBefore('shutdown', function () use ($logger, $healthManager, $connector, $server) {
         $workerId = $server->getWorkerId();

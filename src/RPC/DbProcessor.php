@@ -17,6 +17,7 @@ use Tabula17\Satelles\Omnia\Roga\Exception\StatementExecutionException;
 use Tabula17\Satelles\Omnia\Roga\LoaderInterface;
 use Tabula17\Satelles\Omnia\Roga\LoaderStorageInterface;
 use Tabula17\Satelles\Omnia\Roga\StatementBuilder;
+use Tabula17\Satelles\Utilis\Connectable\HealthManagerInterface;
 use Tabula17\Satelles\Utilis\Exception\InvalidArgumentException;
 use Tabula17\Satelles\Utilis\Exception\RuntimeException;
 use Throwable;
@@ -31,11 +32,12 @@ class DbProcessor implements RpcInternalPorcessorInterface
      * @param LoggerInterface|null $db_logger
      */
     public function __construct(
-        public Connector                  $connector,
-        public DbConfigCollection         $poolCollection,
-        public LoaderStorageInterface     $loaderStorage,
-        public ?LoggerInterface           $logger = null,
-        private readonly ?LoggerInterface $db_logger = null
+        public Connector                         $connector,
+        public DbConfigCollection                $poolCollection,
+        public LoaderStorageInterface            $loaderStorage,
+        public ?LoggerInterface                  $logger = null,
+        private readonly ?LoggerInterface        $db_logger = null,
+        public readonly ?HealthManagerInterface $healthManager = null
     )
     {
     }
@@ -247,7 +249,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
         return $this->loaderStorage->getStatementInfo($params['cfg']);
     }
 
-    public function init(?Fluxus $server): void
+    public function init(Fluxus $server): void
     {
         try {
             $this->connector->loadConnections($this->poolCollection);
@@ -260,15 +262,17 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     $this->logger?->notice("Connection {$connection->name} unreachable: " . $connection->lastConnectionError ?? 'Unknown error');
                 }
             }
+            $this->healthManager?->startHealthCheckCycle($server, $server->getWorkerId());
         } catch (Throwable $e) {
             $this->logger?->error('Error inicializando DB Processor: ' . $e->getMessage());
         }
     }
 
-    public function deInit(?Fluxus $server): void
+    public function deInit(Fluxus $server): void
     {
         $logger = $server->logger ?? $this->logger;
         $logger?->info('Closing ALL DB Processor connections...');
+        $this->healthManager?->stopHealthCheckCycle(1);
         $this->connector->closeAllPools();
     }
 }
