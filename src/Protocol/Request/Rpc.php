@@ -73,9 +73,11 @@ class Rpc extends Base implements RequestHandlerInterface
                 $server->sendRpcError($fd, $requestId, 'No autenticado', 401);
                 return;
             }
-            $roles = isset($methodInfo['allowed_roles']) ? explode('|', $methodInfo['allowed_roles']) : ['ws:general', 'ws:user'];
+            $roles = !empty($methodInfo['allowed_roles']) ? explode('|', $methodInfo['allowed_roles']) : ['ws:general', 'ws:user'];
+
+            $server->logger?->debug("Roles permitidos: ".print_r($roles, true));
             if (!empty($roles) && !in_array('ws:general', $roles, false) && empty(array_intersect($roles, $server->userRoles($fd)))) {
-                $server->sendRpcError($fd, $requestId, 'No autorizado', 403);
+                $server->sendRpcError($fd, $requestId, 'No autorizado, roles necesarios: '.$methodInfo['allowed_roles'], 403);
                 return;
             }
 

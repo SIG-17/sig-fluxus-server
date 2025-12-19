@@ -88,6 +88,21 @@ $logger = new Monolog\Logger($instance);
 $handler = new Monolog\Handler\StreamHandler('php://stderr', $debugLevel);
 $handler->setFormatter(new ColoredLineFormatter());
 $logger->pushHandler($handler);
+// En router.php, al inicio del script:
+$pidFile = __DIR__ . '/../runtime/pid' . ($arguments['p'] ?? '');
+
+// Limpiar PID file si existe (por si hubo un crash previo)
+if (file_exists($pidFile)) {
+    $oldPid = (int)file_get_contents($pidFile);
+    if ($oldPid > 0 && posix_kill($oldPid, 0)) {
+        $logger->warning("⚠️  Ya hay un servidor corriendo con PID $oldPid");
+        // Intentar terminar el proceso anterior
+        posix_kill($oldPid, SIGTERM);
+        sleep(1);
+    }
+    unlink($pidFile);
+}
+
 
 global $server;
 
@@ -285,7 +300,7 @@ try {
                 'pid' => posix_getpid()
         ];
     });
-    if ($server->setting['task_worker_num'] > 0) {
+/*    if ($server->setting['task_worker_num'] > 0) {
         $server->registerRpcMethod(
                 method: 'db.failures.retry.task',
                 handler: function ($params, $fd) use ($server, $logger) {
@@ -371,15 +386,7 @@ try {
     );
     $server->registerRpcMethod(
             method: 'db.failures.retry',
-            handler: function ($server, $params, $fd) use ($logger) {
-
-                /**
-                 * @var DbProcessor $processor
-                 */
-                $processor = $server->getInternalRpcProcessor('db');
-                $healthManager = $processor->healthManager;
-
-
+            handler: function ($server, $params, $fd) use ($logger, $healthManager) {
                 $logger->info("Forcing retry permanent db failures from client {$fd}");
                 return [
                         'status' => 'ok',
@@ -392,27 +399,16 @@ try {
             allowed_roles: ['ws:admin'],
             description: 'Forces retry of permanent failures in the database connection pool',
             only_internal: true
-    );
+    )
     $server->registerRpcMethod('db.health.status', function ($server, $params, $fd) use ($healthManager) {
-        /**
-         * @var DbProcessor $processor
-         */
-        $processor = $server->getInternalRpcProcessor('db');
-        $wHealthManager = $processor->healthManager;
         return [
                 'status' => 'ok',
                 'health' => $healthManager->getHealthStatus(),
-                'health_worker' => $wHealthManager->getHealthStatus(),
                 'timestamp' => time(),
                 'worker_id' => $server->getWorkerId()
         ];
-    });
-    $server->registerRpcMethod('db.health.history', function (Fluxus $server, $params, $fd) {
-        /**
-         * @var DbProcessor $processor
-         */
-        $processor = $server->getInternalRpcProcessor('db');
-        $healthManager = $processor->healthManager;
+    });;
+    $server->registerRpcMethod('db.health.history', function (Fluxus $server, $params, $fd) use ($healthManager) {
         return [
                 'status' => 'ok',
                 'health' => $healthManager->getCheckHistory(), //$healthManager->getCheckHistory(),
@@ -421,25 +417,33 @@ try {
         ];
     });
 
-    $server->registerRpcMethod('db.health.check.now', function ($server, $params, $fd) use ($logger) {
+    $server->registerRpcMethod('db.health.check.now', function ($server, $params, $fd) use ($logger, $healthManager) {
         $logger->info("Forcing health check from client {$fd}");
-        /**
-         * @var DbProcessor $processor
-         */
-        $processor = $server->getInternalRpcProcessor('db');
-        $healthManager = $processor->healthManager;
         // Ejecutar check inmediato
-        $healthManager->performHealthChecks($server->getWorkerId());
+        $poolHealth = $healthManager->performHealthChecks($server->getWorkerId());
         return [
                 'status' => 'ok',
                 'message' => 'Health check executed',
-                'results' => $healthManager->getHealthStatus(),
+                'results' => ['env' => $healthManager->getHealthStatus(), 'pool' => $poolHealth],
                 'timestamp' => time()
         ];
     });
+    */
 
+    $server->onAfter('start', function () use ($logger, $instance, $server, $pidFile) {
+        // Guardar nuestro PID cuando el servidor inicie
+        $masterPid = $server->master_pid;
+        file_put_contents($pidFile, $masterPid);
+        $logger->info("📝 PID guardado: $masterPid");
 
-    $server->onAfter('start', function () use ($logger, $instance, $server) {
+        // Registrar función para limpiar al salir
+        register_shutdown_function(static function () use ($pidFile, $logger) {
+            if (file_exists($pidFile)) {
+                unlink($pidFile);
+                $logger->debug("🗑️  PID file eliminado");
+            }
+        });
+
         $logger->info('🛣️ Buscando canales para inicializar, instancia: ' . $instance . '');
         $channelCfgIterator = new RecursiveDirectoryIterator(__DIR__ . '/../config/channels');
         $recursiveIterator = new RecursiveIteratorIterator($channelCfgIterator);

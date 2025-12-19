@@ -5,6 +5,8 @@ namespace SIG\Server\RPC;
 use JsonException;
 use PDO;
 use Psr\Log\LoggerInterface;
+use SIG\Server\Collection\MethodsCollection;
+use SIG\Server\Exception\InvalidArgumentException;
 use SIG\Server\Fluxus;
 use Tabula17\Satelles\Omnia\Roga\Database\Connector;
 use Tabula17\Satelles\Omnia\Roga\Database\DbConfig;
@@ -14,11 +16,9 @@ use Tabula17\Satelles\Omnia\Roga\Exception\ConfigException;
 use Tabula17\Satelles\Omnia\Roga\Exception\ConnectionException;
 use Tabula17\Satelles\Omnia\Roga\Exception\ExceptionDefinitions;
 use Tabula17\Satelles\Omnia\Roga\Exception\StatementExecutionException;
-use Tabula17\Satelles\Omnia\Roga\LoaderInterface;
 use Tabula17\Satelles\Omnia\Roga\LoaderStorageInterface;
 use Tabula17\Satelles\Omnia\Roga\StatementBuilder;
 use Tabula17\Satelles\Utilis\Connectable\HealthManagerInterface;
-use Tabula17\Satelles\Utilis\Exception\InvalidArgumentException;
 use Tabula17\Satelles\Utilis\Exception\RuntimeException;
 use Throwable;
 
@@ -30,14 +30,15 @@ class DbProcessor implements RpcInternalPorcessorInterface
      * @param LoaderStorageInterface $loaderStorage
      * @param LoggerInterface|null $logger
      * @param LoggerInterface|null $db_logger
+     * @param HealthManagerInterface|null $healthManager
      */
     public function __construct(
-        public Connector                         $connector,
-        public DbConfigCollection                $poolCollection,
-        public LoaderStorageInterface            $loaderStorage,
-        public ?LoggerInterface                  $logger = null,
-        private readonly ?LoggerInterface        $db_logger = null,
-        public readonly ?HealthManagerInterface $healthManager = null
+        public Connector                  $connector,
+        public DbConfigCollection         $poolCollection,
+        public LoaderStorageInterface     $loaderStorage,
+        public ?LoggerInterface           $logger = null,
+        private readonly ?LoggerInterface $db_logger = null,
+        public ?HealthManagerInterface    $healthManager = null
     )
     {
     }
@@ -251,6 +252,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
 
     public function init(Fluxus $server): void
     {
+        $workerId = $server->getWorkerId();
         try {
             $this->connector->loadConnections($this->poolCollection);
             foreach ($this->connector->getPoolGroupNames() as $poolGroupName) {
@@ -262,17 +264,410 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     $this->logger?->notice("Connection {$connection->name} unreachable: " . $connection->lastConnectionError ?? 'Unknown error');
                 }
             }
-            $this->healthManager?->startHealthCheckCycle($server, $server->getWorkerId());
+            $logger = $server->logger ?? $this->logger;
+            //$this->healthManager?->startHealthCheckCycle($server, $server->getWorkerId());
+            if ($workerId === false) {
+                $this->logger?->info("Master process es el coordinador de Health. Iniciando ciclo.");
+                $server->registerRpcMethod(
+                    method: 'db.failures.retry.task',
+                    handler: function ($params, $fd) use ($server) {
+                        $taskData = [
+                            'type' => 'broadcast_task',
+                            'method' => 'db.failures.retry',
+                            'broadcast_to_all' => true,
+                            'timestamp' => time()
+                        ];
+
+                        $taskId = $server->task($taskData);
+                        return [
+                            'status' => 'ok',
+                            'message' => 'Task de reconexión enviada',
+                            'task_id' => $taskId,
+                            'timestamp' => time()
+                        ];
+                    },
+                    requires_auth: true,
+                    allowed_roles: ['ws:admin'],
+                    description: 'Forces retry of permanent failures in ALL workers'
+                );
+                $this->healthManager?->registerNotifier(function ($changes) use ($server) {
+                    $this->notifyToWorkers($changes, $server);
+                });
+                $this->healthManager?->startHealthCheckCycle($server, $workerId);
+
+            } else {
+                $this->logger?->info("Worker #{$workerId} listo. Health checks a cargo del Master process.");
+                // Podemos registrar un método para consultar el estado centralizado
+            }
         } catch (Throwable $e) {
             $this->logger?->error('Error inicializando DB Processor: ' . $e->getMessage());
         }
     }
 
+    private function notifyToWorkers(array $failures, Fluxus $server): void
+    {
+        $this->logger?->debug('Changes on DB connections detected: ' . implode(', ', ($failures)));
+        /*
+         *
+                'recovered_count' => $result['recovered'],
+                'timestamp' => time(),
+                'source_worker' => 0
+         */
+        $this->logger->info("✅ Master process recuperó {$failures['recovered']} conexiones. Notificando a todos los workers.");
+
+
+        // **OPCIÓN A: Usar sendMessage (para workers normales) - RECOMENDADA**
+        $message = json_encode([
+            'action' => 'rpc',
+            'method' => 'db.failures.retry',
+            'params' => [],
+            'source_fd' => 0,
+            'source_worker' => -1,
+            'request_id' => uniqid('broadcast_', true),
+            'timestamp' => time()
+        ], JSON_THROW_ON_ERROR);
+
+        // Enviar a todos los workers vía pipeMessage
+        for ($i = 1; $i < $server->setting['worker_num']; $i++) {
+            $server->sendMessage($message, $i);
+        }
+
+    }
+
     public function deInit(Fluxus $server): void
     {
+        $workerId = $server->getWorkerId();
         $logger = $server->logger ?? $this->logger;
-        $logger?->info('Closing ALL DB Processor connections...');
-        $this->healthManager?->stopHealthCheckCycle(1);
+        if ($workerId === false) {
+            $logger?->info('Stopping Health Check Cycle for Master process...');
+            $logger?->info("Closing ALL DB Processor connections for Master process...");
+            $this->healthManager?->stopHealthCheckCycle(1);
+        } else {
+            $logger?->info("Closing ALL DB Processor connections for Worker #$workerId...");
+
+        }
         $this->connector->closeAllPools();
+    }
+
+    public function methodsToRegister(Fluxus $server): ?MethodsCollection
+    {
+        $logger = $server->logger ?? $this->logger;
+        $connector = $this->connector;
+        $methods = MethodsCollection::fromArray(
+            [
+                [
+                    'method' => 'db.statement.list',
+                    'description' => 'Db descriptors list',
+                    'requires_auth' => false,
+                    'allowed_roles' => ['ws:user'],
+                    'only_internal' => false,
+                    'handler' => static function (Fluxus $server, $params, $fd) {
+                        return $server->getInternalRpcProcessor('db')?->process('db.statement.list', $params);
+                    }
+                ],
+                [
+                    'method' => 'db.statement.info',
+                    'description' => 'Db statement info',
+                    'requires_auth' => false,
+                    'allowed_roles' => ['ws:admin', 'ws:user'],
+                    'only_internal' => true,
+                    'handler' => static function (Fluxus $server, $params, $fd) {
+                        if (!isset($params['cfg'])) {
+                            throw new InvalidArgumentException('{db.statement.info}  "cfg" is required for this method');
+                        }
+                        return $server->getInternalRpcProcessor('db')?->process('db.statement.info', $params);
+                    }
+                ],
+                [
+                    'method' => 'db.processor',
+                    'description' => 'Database processor for Statements',
+                    'requires_auth' => false,
+                    'allowed_roles' => ['ws:admin', 'ws:user'],
+                    'only_internal' => true,
+                    'handler' => static function (Fluxus $server, $params, $fd) {
+                        $server->logger->debug("DB request received from: " . $fd);
+                        return $server->getInternalRpcProcessor('db')?->process('db.processor', $params);
+                    }
+                ],
+                [
+                    'method' => 'db.pool.health',
+                    'description' => 'DB Pool health status',
+                    'requires_auth' => false,
+                    'allowed_roles' => ['ws:admin', 'ws:user'],
+                    'only_internal' => false,
+                    'handler' => static function (Fluxus $server, $params, $fd) {
+                        $db = $server->getInternalRpcProcessor('db');
+                        return [
+                            'status' => 'ok',
+                            'database_health' => $db?->connector->getHealthStatus() ?? [],
+                            'pool_stats' => $db?->connector->getPoolStats() ?? [],
+                            'timestamp' => time(),
+                            'worker_id' => $server->getWorkerId()
+                        ];
+                    }
+                ],
+                [
+                    'method' => 'db.pool.health.all',
+                    'description' => 'DB Pool health status for all workers',
+                    'requires_auth' => true,
+                    'allowed_roles' => ['ws:admin'],
+                    'only_internal' => false,
+                    'handler' => static function (Fluxus $server, $params, $fd) {
+                        $workerId = $server->getWorkerId();
+                        $requestId = uniqid('health_all_', true);
+                        $timeout = $params['timeout'] ?? 1500;
+
+                        $server->logger->info("📡 Recolectando health de TODOS los workers (Request: $requestId)");
+
+                        // Inicializar almacenamiento para respuestas
+                        if (!isset($server->collectResponses)) {
+                            $server->collectResponses = [];
+                        }
+                        $server->collectResponses[$requestId] = [];
+
+                        // Canal para esperar respuestas
+                        $responseChannel = new \Swoole\Coroutine\Channel(
+                            $server->setting['worker_num'] ?? 4
+                        );
+
+                        // 1. Guardar respuesta local
+                        $localHealth = [];
+                        if (isset($server->rpcHandlers['db.pool.health'])) {
+                            try {
+                                $localHealth = $server->rpcHandlers['db.pool.health']($server, [], $fd);
+                            } catch (\Exception $e) {
+                                $localHealth = ['error' => $e->getMessage(), 'worker_id' => $workerId];
+                            }
+                        }
+                        $server->collectResponses[$requestId][$workerId] = [
+                            'data' => $localHealth,
+                            'success' => $localHealth['status'] === 'ok' ?? false,
+                            'timestamp' => $data['timestamp'] ?? time(),
+                            'source_worker' => $workerId
+                        ];
+
+                        $responseChannel->push($workerId);
+
+                        // 2. Enviar broadcast a otros workers
+                        $message = json_encode([
+                            'action' => 'broadcast_collect',
+                            'collect_action' => 'db.pool.health',
+                            'request_id' => $requestId,
+                            'response_to_worker' => $workerId,
+                            'need_response' => true,
+                            'timestamp' => time()
+                        ], JSON_THROW_ON_ERROR);
+
+                        $totalWorkers = $server->setting['worker_num'] ?? 1;
+                        $sentCount = 0;
+
+                        for ($i = 0; $i < $totalWorkers; $i++) {
+                            if (($i !== $workerId) && $server->sendMessage($message, $i)) {
+                                $sentCount++;
+                            }
+                        }
+
+                        // 3. Esperar respuestas con timeout
+                        $startTime = microtime(true);
+                        $expectedResponses = $sentCount;
+                        $receivedResponses = 1; // Local
+
+                        while ($receivedResponses < ($expectedResponses + 1)) {
+                            $elapsed = (microtime(true) - $startTime) * 1000;
+
+                            if ($elapsed > $timeout) {
+                                $server->logger->warning("⏰ Timeout esperando respuestas ($elapsed ms)");
+                                break;
+                            }
+
+                            // Esperar respuesta en el canal
+                            $result = $responseChannel->pop(0.1); // 100ms timeout
+                            if ($result !== false) {
+                                $receivedResponses++;
+                                $server->logger->debug("📥 Respuesta recibida, total: $receivedResponses");
+                            }
+                        }
+
+                        // 4. Procesar resultados
+                        $allResults = $server->collectResponses[$requestId] ?? [];
+                        array_walk($allResults, static function (&$result) {
+                            if (isset($result['data'])) {
+                                $result = $result['data'];
+                            }
+                        });
+                        // Limpiar
+                        unset($server->collectResponses[$requestId]);
+
+                        // Calcular estadísticas
+                        $summary = [
+                            'total_workers' => $totalWorkers,
+                            'responded_workers' => count($allResults),
+                            'successful' => 0,
+                            'failed' => 0
+                        ];
+
+                        foreach ($allResults as $wId => $result) {
+                            if (isset($result['status']) && $result['status'] === 'ok') {
+                                $summary['successful']++;
+                            } else {
+                                $summary['failed']++;
+                            }
+                        }
+
+                        return [
+                            'status' => 'ok',
+                            'message' => 'Health recolectado',
+                            'request_id' => $requestId,
+                            'summary' => $summary,
+                            'data' => $allResults,
+                            'current_worker' => $workerId,
+                            'timestamp' => time()
+                        ];
+                    }
+                ],
+                [
+                    'method' => 'db.failures.retry',
+                    'description' => 'Forces retry of permanent failures in the database connection pool',
+                    'requires_auth' => true,
+                    'only_internal' => true,
+                    'handler' => static function (Fluxus $server, $params, $fd) use ($logger, $connector) {
+                        $logger->info("Forcing retry permanent db failures from client {$fd}");
+                        return [
+                            'status' => 'ok',
+                            'message' => 'DB Connector retrying permanent failures: Executed!',
+                            'results' => $connector->retryFailedConnections(),
+                            'timestamp' => time()
+                        ];
+                    }
+                ],
+                [
+                    'method' => 'db.failures.retry.task',
+                    'description' => 'Forces retry of permanent failures in ALL workers',
+                    'requires_auth' => true,
+                    'allowed_roles' => ['ws:admin'],
+                    'only_internal' => false,
+                    'handler' => static function (Fluxus $server, $params, $fd) {
+                        $taskData = [
+                            'type' => 'broadcast_task',
+                            'method' => 'db.failures.retry',
+                            'broadcast_to_all' => true,
+                            'timestamp' => time()
+                        ];
+
+                        $taskId = $server->task($taskData);
+                        return [
+                            'status' => 'ok',
+                            'message' => 'Task de reconexión enviada',
+                            'task_id' => $taskId,
+                            'timestamp' => time()
+                        ];
+                    }
+                ],
+                [
+
+                    'method' => 'db.failures.retry.broadcast',
+                    'description' => 'Forces retry of permanent failures in ALL workers',
+                    'requires_auth' => true,
+                    'allowed_roles' => ['ws:admin'],
+                    'only_internal' => false,
+                    'handler' => static function ($server, $params, $fd) use ($logger, $connector) {
+                        $workerId = $server->getWorkerId();
+                        $logger->info("📡 Broadcast de reconexión iniciado por cliente {$fd} en worker #{$workerId}");
+                        // Ejecutar localmente primero
+                        $localResult = [];
+                        try {
+                            // $localResult = $server->rpcHandlers['db.failures.retry']([], $fd);
+                            $localResult = $connector->retryFailedConnections();
+                            $logger->info("✅ Reconexión ejecutada localmente en worker #{$workerId}");
+                        } catch (\Exception $e) {
+                            $logger->error("❌ Error en reconexión local: " . $e->getMessage());
+                        }
+
+                        // **OPCIÓN A: Usar sendMessage (para workers normales) - RECOMENDADA**
+                        $message = json_encode([
+                            'action' => 'rpc',
+                            'method' => 'db.failures.retry',
+                            'params' => [],
+                            'source_fd' => $fd,
+                            'source_worker' => $workerId,
+                            'request_id' => uniqid('broadcast_', true),
+                            'timestamp' => time()
+                        ], JSON_THROW_ON_ERROR);
+
+                        $sentCount = 0;
+                        $totalWorkers = $server->setting['worker_num'] ?? 1;
+
+                        for ($i = 0; $i < $totalWorkers; $i++) {
+                            if ($i !== $workerId) {
+                                try {
+                                    if ($server->sendMessage($message, $i)) {
+                                        $sentCount++;
+                                        $logger->debug("📨 Mensaje enviado al worker #{$i}");
+                                    }
+                                } catch (\Exception $e) {
+                                    $logger->warning("⚠️ No se pudo enviar al worker #{$i}: " . $e->getMessage());
+                                }
+                            }
+                        }
+
+                        return [
+                            'status' => 'ok',
+                            'message' => 'Comando de reconexión enviado a todos los workers',
+                            'local_executed' => !empty($localResult),
+                            'broadcasted_to' => $sentCount . ' workers',
+                            'total_workers' => $totalWorkers,
+                            'current_worker' => $workerId,
+                            'timestamp' => time()
+                        ];
+                    }
+                ]
+            ]
+        );
+        if (isset($this->healthManager)) {
+            $healthManager = $this->healthManager;
+            $methods->add(
+                [
+                    'method' => 'db.health.status',
+                    'description' => 'DB Connector health status',
+                    'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager) {
+                        return [
+                            'status' => 'ok',
+                            'health' => $healthManager->getHealthStatus(),
+                            'timestamp' => time(),
+                            'worker_id' => $server->getWorkerId()
+                        ];
+                    }
+                ]);
+            $methods->add([
+                'method' => 'db.health.history',
+                'description' => 'DB Connector health checks history',
+                'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager) {
+                    return [
+                        'status' => 'ok',
+                        'health' => $healthManager->getCheckHistory(), //$healthManager->getCheckHistory(),
+                        'timestamp' => time(),
+                        'worker_id' => $server->getWorkerId()
+                    ];
+                }
+            ]);
+            $methods->add([
+                'method' => 'db.health.check.now',
+                'description' => 'DB Connector health check',
+                'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager, $logger) {
+                    $logger->info("Forcing health check from client {$fd}");
+                    // Ejecutar check inmediato
+                    $poolHealth = $healthManager->performHealthChecks($server->getWorkerId());
+                    return [
+                        'status' => 'ok',
+                        'message' => 'Health check executed',
+                        'results' => ['env' => $healthManager->getHealthStatus(), 'pool' => $poolHealth],
+                        'timestamp' => time()
+                    ];
+                }
+            ]);
+        }
+        $workerId = $server->getWorkerId();
+        $server->logger?->debug("Register RPC methods for worker #{$workerId}:");
+        return !$workerId ? $methods : null;
     }
 }

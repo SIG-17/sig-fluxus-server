@@ -125,6 +125,7 @@ class Fluxus extends Server
      * @var bool $signalsConfigured
      */
     private bool $signalsConfigured = false;
+    public int $workerId = -1;
 
     public function __construct(
         TCPServerConfig                  $config,
@@ -311,6 +312,7 @@ class Fluxus extends Server
 
     private function initializeOnWorkers(Server $server, int $workerId): void
     {
+        $this->workerId = $workerId;
         $this->logger?->info("👷 Worker #{$workerId} iniciado - PID: " . posix_getpid());
 
         // Inicializar procesadores RPC internos
@@ -323,7 +325,8 @@ class Fluxus extends Server
             return;
         }
 
-        $this->logger?->info('🔧 Configurando handlers de señales...');
+        $workerId = $this->getWorkerId();
+        $this->logger?->info("🔧 Configurando handlers de señales en Worker #$workerId...");
 
         // Solo el proceso maestro debe configurar señales
         pcntl_async_signals(true);
@@ -336,7 +339,9 @@ class Fluxus extends Server
 
         // SIGINT - Ctrl+C
         pcntl_signal(SIGINT, function (int $signo) {
-            $this->logger?->info("📡 Señal SIGINT (Ctrl+C) recibida, iniciando shutdown...");
+            $workerId = $this->workerId;
+            $pid = posix_getpid();
+            $this->logger?->info("📡 Señal SIGINT (Ctrl+C) recibida en Worker #$workerId (PID $pid), iniciando shutdown...");
             $this->shutdownOnSignal($signo);
         });
 
@@ -367,7 +372,8 @@ class Fluxus extends Server
         });
         $this->onPrivateEvent('beforeShutdown', function () {
             $this->isShuttingDown = true;
-            $this->logger?->debug('🛑 Deteniendo servicios...');
+            $workerId = $this->getWorkerId() ?? $this->workerId;
+            $this->logger?->debug("🛑 Deteniendo servicios en Worker #$this->workerId...");
             $this->cleanUpServer();
         });
         $this->onPrivateEvent('workerStart', function () {
@@ -390,11 +396,13 @@ class Fluxus extends Server
     public function start(): bool
     {
         $this->serverId = $this->getServerId();
+        $workerId = $this->getWorkerId();
+        $pid = posix_getpid();
         $this->initRpcTables();
         $this->initPubSubTables();
         $this->isShuttingDown = false;
         $this->isStopped = false;
-        $this->logger?->info('Iniciando servidor...');
+        $this->logger?->info("🏁 Iniciando servidor {$this->serverId}: Worker #$workerId (PID: $pid)...");
         $this->runEventActions('start', [], 'before');
         $started = parent::start();
         $this->logger?->info('Servidor iniciado');
@@ -537,7 +545,8 @@ class Fluxus extends Server
 
     private function cleanUpRpcProcessors(string $logPrefix = '🛑'): void
     {
-        $this->logger?->debug("$logPrefix Limpiando procesadores RPC...");
+        $workerId = $this->getWorkerId() ?? $this->workerId;
+        $this->logger?->debug("$logPrefix Worker #$workerId: Limpiando procesadores RPC...".var_export($workerId, true));
         foreach ($this->rpcInternalProcessors as $processor) {
             if ($processor instanceof RpcInternalPorcessorInterface) {
                 $processor->deInit($this);
@@ -578,7 +587,7 @@ class Fluxus extends Server
 
     private function cleanUpServer(): void
     {
-        $workerId = $this->getWorkerId();
+        $workerId = $this->getWorkerId() ?? $this->workerId;
         $this->logger?->info("🧹 #$workerId Limpiando recursos...");
         $this->stopRedisServices("🧹");
         $this->cleanUpPubSub("🧹");
@@ -1302,7 +1311,7 @@ class Fluxus extends Server
                     'data' => $result,
                     'success' => true,
                     'timestamp' => time()
-                ]);
+                ], JSON_THROW_ON_ERROR);
 
                 $this->sendMessage($response, $responseToWorker);
 
@@ -1317,7 +1326,7 @@ class Fluxus extends Server
                     'error' => $e->getMessage(),
                     'success' => false,
                     'timestamp' => time()
-                ]);
+                ], JSON_THROW_ON_ERROR);
 
                 $this->sendMessage($errorResponse, $responseToWorker);
             }
@@ -1356,7 +1365,7 @@ class Fluxus extends Server
                     'method' => $method,
                     'success' => true,
                     'timestamp' => time()
-                ]);
+                ], JSON_THROW_ON_ERROR);
                 $this->sendMessage($response, $srcWorkerId);
             }
 
@@ -1472,7 +1481,7 @@ class Fluxus extends Server
 
         // Guardar handler en ESTE worker
         $this->rpcHandlers[$method] = $handler;
-        $roles = !empty($allowed_roles) ? implode('|', $allowed_roles) : [];
+        $roles = !empty($allowed_roles) ? implode('|', $allowed_roles) : '';
         // Solo el primer worker que encuentre el método vacío en la tabla lo registra
         if (!$this->rpcMethods->exist($method)) {
             $this->rpcMethods->set($method, [
@@ -1484,7 +1493,7 @@ class Fluxus extends Server
                 'only_internal' => $only_internal ? 1 : 0,
                 'registered_at' => time()
             ]);
-            $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method");
+            $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method para los roles $roles");
         } else {
             $this->logger?->debug("📝 Método $method ya en tabla, solo registrando handler en worker #$workerId");
         }
@@ -1505,10 +1514,15 @@ class Fluxus extends Server
             $this->logger?->warning('Processor ' . $processorName . ' already registered as internal RPC processor. Skipping...');
             return;
         }
+        $this->logger?->debug('🥌 Registering internal RPC processor ' . $processorName);
         if ($this->isRunning()) {
             $processor->init($this);
         }
         $this->rpcInternalProcessors[$processorName] = $processor;
+        if ($processor->methodsToRegister($this)) {
+            $this->logger?->debug('🥌 -> Registering RPC methods for internal RPC processor ' . $processorName);
+            $this->registerRpcMethods($processor->methodsToRegister($this));
+        }
     }
 
     public function getInternalRpcProcessor(string $processorName): ?RpcInternalPorcessorInterface
