@@ -1519,9 +1519,9 @@ class Fluxus extends Server
             $processor->init($this);
         }
         $this->rpcInternalProcessors[$processorName] = $processor;
-        if ($processor->methodsToRegister($this)) {
+        if ($processor->fetchRpcMethods($this)) {
             $this->logger?->debug('🥌 -> Registering RPC methods for internal RPC processor ' . $processorName);
-            $this->registerRpcMethods($processor->methodsToRegister($this));
+            $this->registerRpcMethods($processor->fetchRpcMethods($this));
         }
     }
 
