@@ -4,7 +4,6 @@ namespace SIG\Server\Protocol\Request;
 
 use SIG\Server\Fluxus;
 use SIG\Server\Protocol\Status;
-use Swoole\Coroutine;
 use Tabula17\Satelles\Utilis\Config\AbstractDescriptor;
 
 class Rpc extends Base implements RequestHandlerInterface
@@ -30,7 +29,6 @@ class Rpc extends Base implements RequestHandlerInterface
     }
     public function handle(int $fd, Fluxus $server): void
     {
-
         $requestId = $this->id ?? $server->generateRpcId();
         $method = $this->method ?? '';
 
@@ -64,9 +62,11 @@ class Rpc extends Base implements RequestHandlerInterface
 
             // Verificar en tabla para metadata
             $requiresAuth = false;
+            $coroutine = true;
             if ($server->getRpcMethods()->exist($method)) {
                 $methodInfo = $server->getRpcMethods()->get($method);
                 $requiresAuth = (bool)$methodInfo['requires_auth'];
+                $coroutine = (bool)$methodInfo['coroutine'];
             }
 
             if ($requiresAuth && !$server->isAuthenticated($fd)) {
@@ -90,10 +90,8 @@ class Rpc extends Base implements RequestHandlerInterface
                     'timestamp' => time()
                 ]
             ]);
-
             // Confirmación de aceptación de RPC
             $server->sendToClient($fd, $status);
-
             // Guardar solicitud
             $server->rpcRequests->set($requestId, [
                 'request_id' => $requestId,
@@ -105,12 +103,9 @@ class Rpc extends Base implements RequestHandlerInterface
                 'worker_id' => $workerId
             ]);
 
-            $server->logger?->debug("🚀 Ejecutando RPC: $method en worker #{$workerId}");
+            $server->logger?->debug("🚀 Ejecutando RPC: $method en worker #{$workerId} con ID: $requestId y timeout de: $timeout");
 
-            // Ejecutar en corutina
-            Coroutine::create(function () use ($fd, $requestId, $method, $params, $timeout, $workerId, $server) {
-                $server->executeRpcMethod($fd, $requestId, $method, $params, $timeout, $workerId);
-            });
+            $server->executeRpcMethod($fd, $requestId, $method, $params, $timeout, $workerId, $coroutine);
 
 
         } catch (\Exception $e) {

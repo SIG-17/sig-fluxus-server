@@ -13,6 +13,7 @@ class Type extends AbstractDescriptor
     protected(set) string $fileAvailable = 'file_available';
     protected(set) string $fileResponse = 'file_response';
     protected(set) string $rpcResponse = 'rpc_response';
+    protected(set) string $rpcSuccess = 'rpc_success';
     protected(set) string $rpcError = 'rpc_error';
     protected(set) string $rpcMethodsList = 'rpc_methods_list';
     protected(set) string $authResponse = 'auth_response';

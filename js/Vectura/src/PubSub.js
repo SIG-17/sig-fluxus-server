@@ -34,6 +34,7 @@ Ext.define('Vectura.PubSub', {
     MESSAGE_TYPE_FILE_AVAILABLE: 'file_available',
     MESSAGE_TYPE_FILE_RESPONSE: 'file_response',
     MESSAGE_TYPE_RPC_RESPONSE: 'rpc_response',
+    MESSAGE_TYPE_RPC_SUCCESS: 'rpc_success',
     MESSAGE_TYPE_RPC_METHODS: 'rpc_methods_list',
     MESSAGE_TYPE_ERROR: 'error',
     MESSAGE_TYPE_MESSAGE: 'message',
@@ -210,7 +211,7 @@ Ext.define('Vectura.PubSub', {
      * Constructor
      * @param {Object} config Configuration object
      */
-    constructor: function(config) {
+    constructor: function (config) {
         this.callParent([config]);
         this.initConfig(config);
 
@@ -241,7 +242,7 @@ Ext.define('Vectura.PubSub', {
     /**
      * Establishes a WebSocket connection.
      */
-    connect: function() {
+    connect: function () {
         if (this.isManualClose) {
             this.debug('Manually closed connection, do not reconnect');
             return;
@@ -260,10 +261,10 @@ Ext.define('Vectura.PubSub', {
     /**
      * Sets up WebSocket event listeners.
      */
-    setupEventListeners: function() {
+    setupEventListeners: function () {
         var me = this;
 
-        this.ws.onopen = function() {
+        this.ws.onopen = function () {
             me.log('WebSocket connected, authenticating...');
 
             // If there is a token or guests are not allowed, authenticate
@@ -277,7 +278,7 @@ Ext.define('Vectura.PubSub', {
             me.reconnectDelay = 1000;
 
             if (me.toResubscribe.size > 0) {
-                me.toResubscribe.forEach(function(channel) {
+                me.toResubscribe.forEach(function (channel) {
                     me.subscribe(channel);
                 });
                 me.toResubscribe.clear();
@@ -287,7 +288,7 @@ Ext.define('Vectura.PubSub', {
             me.restorePendingCallbacks();
         };
 
-        this.ws.onmessage = function(event) {
+        this.ws.onmessage = function (event) {
             me.debug('Message received:', event);
             try {
                 var data = Ext.decode(event.data);
@@ -311,14 +312,14 @@ Ext.define('Vectura.PubSub', {
             }
         };
 
-        this.ws.onclose = function(event) {
+        this.ws.onclose = function (event) {
             me.info('Connection closed. Code: ' + event.code + ', Reason: ' + event.reason);
 
             if (!me.isManualClose && !event.wasClean &&
                 me.reconnectAttempts < me.getMaxReconnectAttempts()) {
 
                 // Save current subscriptions and callbacks for reconnection
-                me.subscriptions.forEach(function(channel) {
+                me.subscriptions.forEach(function (channel) {
                     if (!me.toResubscribe.has(channel)) {
                         me.toResubscribe.add(channel);
                     }
@@ -358,7 +359,7 @@ Ext.define('Vectura.PubSub', {
             me.channelCallbacks.clear();
         };
 
-        this.ws.onerror = function(error) {
+        this.ws.onerror = function (error) {
             me.error('WebSocket Error:', error);
             me.fireEvent(me.EVENT_TYPE_ERROR, {
                 message: 'WebSocket Error. Status: ' + me.getStatus(),
@@ -370,7 +371,7 @@ Ext.define('Vectura.PubSub', {
     /**
      * Sends token for authentication.
      */
-    authenticate: function() {
+    authenticate: function () {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             return;
         }
@@ -379,7 +380,7 @@ Ext.define('Vectura.PubSub', {
         var authTimeout = this.getAuthTimeout();
 
         // Timeout for authentication
-        this.authTimeoutId = Ext.defer(function() {
+        this.authTimeoutId = Ext.defer(function () {
             if (!me.isAuthenticated) {
                 me.error('Authentication timeout');
                 me.ws.close(4001, 'Authentication timeout');
@@ -398,7 +399,7 @@ Ext.define('Vectura.PubSub', {
      * @param {String} newToken New JWT token
      * @param {Boolean} reauthenticate Whether to reauthenticate
      */
-    updateToken: function(newToken, reauthenticate) {
+    updateToken: function (newToken, reauthenticate) {
         reauthenticate = reauthenticate !== false;
         this.setToken(newToken);
 
@@ -412,7 +413,7 @@ Ext.define('Vectura.PubSub', {
      * Handles authentication response.
      * @param {Object} data Response data
      */
-    handleAuthResponse: function(data) {
+    handleAuthResponse: function (data) {
         Ext.undefer(this.authTimeoutId);
 
         if (data.success) {
@@ -429,7 +430,7 @@ Ext.define('Vectura.PubSub', {
     /**
      * Called when authentication is successful.
      */
-    onAuthenticated: function() {
+    onAuthenticated: function () {
         this.isAuthenticated = true;
         this.log('Authenticated with Pub/Sub server');
         this.fireEvent(this.EVENT_TYPE_READY, {
@@ -440,18 +441,18 @@ Ext.define('Vectura.PubSub', {
     /**
      * Sets up automatic token refresh.
      */
-    setupTokenRefresh: function() {
+    setupTokenRefresh: function () {
         var me = this;
         var interval = this.getTokenRefreshInterval();
 
         if (interval > 0) {
-            this.tokenRefreshTimer = Ext.interval(function() {
+            this.tokenRefreshTimer = Ext.interval(function () {
                 me.refreshToken();
             }, interval);
         }
 
         // Listen for authentication errors
-        this.on('auth_error', function(error) {
+        this.on('auth_error', function (error) {
             me.refreshToken();
         });
     },
@@ -459,16 +460,16 @@ Ext.define('Vectura.PubSub', {
     /**
      * Refreshes token automatically.
      */
-    refreshToken: function() {
+    refreshToken: function () {
         var refreshFn = this.getTokenRefreshFn();
         if (!refreshFn) {
             return;
         }
 
         var me = this;
-        Ext.Promise.resolve(refreshFn()).then(function(newToken) {
+        Ext.Promise.resolve(refreshFn()).then(function (newToken) {
             me.updateToken(newToken, true);
-        }).catch(function(error) {
+        }).catch(function (error) {
             me.error('Error refreshing token:', error);
         });
     },
@@ -476,9 +477,9 @@ Ext.define('Vectura.PubSub', {
     /**
      * Restores pending callbacks after reconnection.
      */
-    restorePendingCallbacks: function() {
+    restorePendingCallbacks: function () {
         var me = this;
-        this.pendingCallbacks.forEach(function(callbackObj, channel) {
+        this.pendingCallbacks.forEach(function (callbackObj, channel) {
             me.addChannelCallback(channel, callbackObj.callback, callbackObj.scope);
         });
         this.pendingCallbacks.clear();
@@ -490,7 +491,7 @@ Ext.define('Vectura.PubSub', {
      * @param {Function} callback Optional callback function
      * @param {Object} scope Optional callback scope
      */
-    subscribe: function(channel, callback, scope) {
+    subscribe: function (channel, callback, scope) {
         if (!this.isReady()) {
             if (!this.isAuthenticated) {
                 this.debug('Not authenticated, saving subscription');
@@ -545,7 +546,7 @@ Ext.define('Vectura.PubSub', {
      * @param {Function} callback Callback function
      * @param {Object} scope Callback scope
      */
-    addChannelCallback: function(channel, callback, scope) {
+    addChannelCallback: function (channel, callback, scope) {
         var callbacks = this.channelCallbacks.get(channel) || [];
         callbacks.push({
             fn: callback,
@@ -559,7 +560,7 @@ Ext.define('Vectura.PubSub', {
      * @param {String} channel The channel name
      * @param {Function} callback Optional specific callback to remove
      */
-    unsubscribe: function(channel, callback) {
+    unsubscribe: function (channel, callback) {
         if (!this.isReady()) {
             return;
         }
@@ -582,7 +583,7 @@ Ext.define('Vectura.PubSub', {
             // Only remove specific callback
             var callbacks = this.channelCallbacks.get(channel);
             if (callbacks) {
-                var newCallbacks = callbacks.filter(function(cb) {
+                var newCallbacks = callbacks.filter(function (cb) {
                     return cb.fn !== callback;
                 });
 
@@ -602,7 +603,7 @@ Ext.define('Vectura.PubSub', {
      * @param {String} channel The channel name
      * @param {Object} data The message data
      */
-    publish: function(channel, data) {
+    publish: function (channel, data) {
         if (!this.isReady()) {
             this.fireEvent(this.EVENT_TYPE_ERROR, {
                 message: 'WebSocket is not connected, please reconnect and try again'
@@ -627,7 +628,7 @@ Ext.define('Vectura.PubSub', {
      * Handles incoming messages.
      * @param {Object} data The message data
      */
-    handleMessage: function(data) {
+    handleMessage: function (data) {
         switch (data.type) {
             case this.MESSAGE_TYPE_MESSAGE:
                 // 1. Fire general event (compatibility)
@@ -647,7 +648,9 @@ Ext.define('Vectura.PubSub', {
                 this.fireEvent('file_available', data);
                 break;
 
+            case this.MESSAGE_TYPE_RPC_ERROR:
             case this.MESSAGE_TYPE_RPC_RESPONSE:
+            case this.MESSAGE_TYPE_RPC_SUCCESS:
                 this.debug('RPC response received:', data);
                 this.handleRpcResponse(data);
                 break;
@@ -677,12 +680,12 @@ Ext.define('Vectura.PubSub', {
      * @param {String} channel The channel
      * @param {Object} data The message data
      */
-    executeChannelCallbacks: function(channel, data) {
+    executeChannelCallbacks: function (channel, data) {
         var callbacks = this.channelCallbacks.get(channel);
         var me = this;
 
         if (callbacks) {
-            callbacks.forEach(function(callbackObj) {
+            callbacks.forEach(function (callbackObj) {
                 try {
                     callbackObj.fn.call(callbackObj.scope, data);
                 } catch (error) {
@@ -698,7 +701,7 @@ Ext.define('Vectura.PubSub', {
      * @param {Object} scope Optional scope for callbacks
      * @return {Object} Fluent interface for the channel
      */
-    channel: function(channel, scope) {
+    channel: function (channel, scope) {
         var me = this;
         var actualScope = scope || this;
 
@@ -708,7 +711,7 @@ Ext.define('Vectura.PubSub', {
              * @param {Function} callback The callback
              * @return {Object} this for chaining
              */
-            subscribe: function(callback) {
+            subscribe: function (callback) {
                 me.subscribe(channel, callback, actualScope);
                 return this;
             },
@@ -718,7 +721,7 @@ Ext.define('Vectura.PubSub', {
              * @param {Function} callback Optional specific callback to remove
              * @return {Object} this for chaining
              */
-            unsubscribe: function(callback) {
+            unsubscribe: function (callback) {
                 me.unsubscribe(channel, callback);
                 return this;
             },
@@ -728,7 +731,7 @@ Ext.define('Vectura.PubSub', {
              * @param {Object} data The data to publish
              * @return {void}
              */
-            publish: function(data) {
+            publish: function (data) {
                 me.publish(channel, data);
             },
 
@@ -736,7 +739,7 @@ Ext.define('Vectura.PubSub', {
              * Check if subscribed to the channel.
              * @return {Boolean}
              */
-            isSubscribed: function() {
+            isSubscribed: function () {
                 return me.subscriptions.has(channel);
             }
         };
@@ -745,7 +748,7 @@ Ext.define('Vectura.PubSub', {
     /**
      * Schedules a reconnection attempt.
      */
-    scheduleReconnect: function() {
+    scheduleReconnect: function () {
         var me = this;
 
         var delay = Math.min(
@@ -765,7 +768,7 @@ Ext.define('Vectura.PubSub', {
             delay: delay
         });
 
-        Ext.defer(function() {
+        Ext.defer(function () {
             me.reconnectAttempts++;
             me.connect();
         }, delay);
@@ -774,17 +777,17 @@ Ext.define('Vectura.PubSub', {
     /**
      * Disconnects from the server.
      */
-    disconnect: function() {
+    disconnect: function () {
         this.isManualClose = true;
 
         if (this.ws) {
             var me = this;
 
-            this.subscriptions.forEach(function(channel) {
+            this.subscriptions.forEach(function (channel) {
                 me.unsubscribe(channel);
             });
 
-            Ext.defer(function() {
+            Ext.defer(function () {
                 me.ws.close(1000, 'Manual disconnect');
                 me.ws = null;
             }, 500);
@@ -808,7 +811,7 @@ Ext.define('Vectura.PubSub', {
      * @param {Number} timeout Timeout in milliseconds
      * @return {Ext.Promise} Promise that resolves when file is sent
      */
-    sendFile: function(channel, file, metadata, timeout) {
+    sendFile: function (channel, file, metadata, timeout) {
         var me = this;
 
         metadata = metadata || {};
@@ -836,7 +839,7 @@ Ext.define('Vectura.PubSub', {
 
         // Timeout
         if (timeout > 0) {
-            timeoutId = Ext.defer(function() {
+            timeoutId = Ext.defer(function () {
                 me.fileHandlers.delete(requestId);
                 deferred.reject(new Error('Timeout sending file'));
             }, timeout);
@@ -844,17 +847,17 @@ Ext.define('Vectura.PubSub', {
 
         // Save handler
         this.fileHandlers.set(requestId, {
-            resolve: function(data) {
+            resolve: function (data) {
                 Ext.undefer(timeoutId);
                 deferred.resolve(data);
             },
-            reject: function(error) {
+            reject: function (error) {
                 Ext.undefer(timeoutId);
                 deferred.reject(error);
             }
         });
 
-        reader.onload = function() {
+        reader.onload = function () {
             var base64Data = reader.result.split(',')[1];
 
             me.ws.send(Ext.encode({
@@ -871,7 +874,7 @@ Ext.define('Vectura.PubSub', {
             }));
         };
 
-        reader.onerror = function() {
+        reader.onerror = function () {
             deferred.reject(new Error('Error reading file'));
         };
 
@@ -887,7 +890,7 @@ Ext.define('Vectura.PubSub', {
      * @param {Object} metadata Optional metadata
      * @return {Ext.Promise} Promise that resolves when file is sent
      */
-    sendLargeFile: function(channel, file, metadata) {
+    sendLargeFile: function (channel, file, metadata) {
         var me = this;
 
         metadata = metadata || {};
@@ -933,7 +936,7 @@ Ext.define('Vectura.PubSub', {
      * @param {String} fileId The file ID
      * @param {Number} chunkIndex The chunk index
      */
-    sendNextChunk: function(fileId, chunkIndex) {
+    sendNextChunk: function (fileId, chunkIndex) {
         var me = this;
         var transfer = this.fileTransfers.get(fileId);
 
@@ -946,7 +949,7 @@ Ext.define('Vectura.PubSub', {
         var chunk = transfer.file.slice(start, end);
 
         var reader = new FileReader();
-        reader.onload = function() {
+        reader.onload = function () {
             var base64Data = reader.result.split(',')[1];
 
             me.ws.send(Ext.encode({
@@ -959,7 +962,7 @@ Ext.define('Vectura.PubSub', {
 
             // Schedule next chunk
             if (chunkIndex < transfer.totalChunks - 1) {
-                Ext.defer(function() {
+                Ext.defer(function () {
                     me.sendNextChunk(fileId, chunkIndex + 1);
                 }, 0);
             }
@@ -974,7 +977,7 @@ Ext.define('Vectura.PubSub', {
      * @param {String} fileName Optional file name
      * @return {Ext.Promise} Promise that resolves with file data
      */
-    requestFile: function(fileId, fileName) {
+    requestFile: function (fileId, fileName) {
         fileName = fileName || 'download';
 
         if (!this.isReady()) {
@@ -1003,7 +1006,7 @@ Ext.define('Vectura.PubSub', {
      * Handles file responses.
      * @param {Object} data The response data
      */
-    handleFileResponse: function(data) {
+    handleFileResponse: function (data) {
         var handler = this.fileHandlers.get(data.request_id);
 
         if (handler) {
@@ -1038,7 +1041,7 @@ Ext.define('Vectura.PubSub', {
      * Handles RPC responses.
      * @param {Object} data The response data
      */
-    handleRpcResponse: function(data) {
+    handleRpcResponse: function (data) {
         var handler = this.rpcHandlers.get(data.id);
 
         if (!handler) {
@@ -1063,13 +1066,13 @@ Ext.define('Vectura.PubSub', {
                 this.debug('RPC ' + data.id + ' (' + handler.method +
                     ') completed in ' + (Date.now() - handler.startTime) + 'ms');
 
-                handler.resolve(data.result);
+                handler.resolve(data.result || data.message);
                 this.rpcHandlers.delete(data.id);
 
                 this.fireEvent(this.EVENT_TYPE_RPC_COMPLETED, {
                     id: data.id,
                     method: handler.method,
-                    result: data.result,
+                    result: data.result || data.message,
                     execution_time: data.execution_time,
                     timestamp: data.timestamp
                 });
@@ -1111,7 +1114,7 @@ Ext.define('Vectura.PubSub', {
      * @param {Number} timeout Timeout in milliseconds
      * @return {Ext.Promise} Promise that resolves with the result
      */
-    rpc: function(method, params, timeout) {
+    rpc: function (method, params, timeout) {
         var me = this;
 
         params = params || {};
@@ -1132,14 +1135,14 @@ Ext.define('Vectura.PubSub', {
             method: method
         });
 
-        var cleanup = function() {
+        var cleanup = function () {
             Ext.undefer(timeoutId);
             me.rpcHandlers.delete(requestId);
         };
 
         // Timeout
         if (timeout > 0) {
-            timeoutId = Ext.defer(function() {
+            timeoutId = Ext.defer(function () {
                 cleanup();
                 deferred.reject(
                     new Error('RPC timeout(' + timeout + 'ms) on method: ' + method)
@@ -1149,11 +1152,11 @@ Ext.define('Vectura.PubSub', {
 
         // Save handler
         this.rpcHandlers.set(requestId, {
-            resolve: function(data) {
+            resolve: function (data) {
                 cleanup();
                 deferred.resolve(data);
             },
-            reject: function(error) {
+            reject: function (error) {
                 cleanup();
                 deferred.reject(error);
             },
@@ -1179,7 +1182,7 @@ Ext.define('Vectura.PubSub', {
      * Lists available RPC methods.
      * @return {Ext.Promise} Promise that resolves with the methods list
      */
-    listRpcMethods: function() {
+    listRpcMethods: function () {
         var me = this;
 
         if (!this.isReady()) {
@@ -1190,7 +1193,7 @@ Ext.define('Vectura.PubSub', {
 
         var deferred = new Ext.Deferred();
 
-        var handler = function(methods) {
+        var handler = function (methods) {
             me.un(me.EVENT_TYPE_RPC_METHODS, handler);
             deferred.resolve(methods);
         };
@@ -1205,7 +1208,7 @@ Ext.define('Vectura.PubSub', {
      * Generates a unique request ID.
      * @return {String} The generated ID
      */
-    generateRequestId: function() {
+    generateRequestId: function () {
         return Date.now().toString(36) + Math.random().toString(36).substr(2);
     },
 
@@ -1214,7 +1217,7 @@ Ext.define('Vectura.PubSub', {
      * @param {Object} blobData The blob data
      * @param {String} fileName Optional file name
      */
-    downloadFile: function(blobData, fileName) {
+    downloadFile: function (blobData, fileName) {
         var link = document.createElement('a');
         link.href = blobData.url;
         link.download = fileName || blobData.name;
@@ -1223,7 +1226,7 @@ Ext.define('Vectura.PubSub', {
         document.body.removeChild(link);
 
         // Release URL after a while
-        Ext.defer(function() {
+        Ext.defer(function () {
             URL.revokeObjectURL(blobData.url);
         }, 1000);
     },
@@ -1232,7 +1235,7 @@ Ext.define('Vectura.PubSub', {
      * Checks if the WebSocket is ready.
      * @return {Boolean} True if ready
      */
-    isReady: function() {
+    isReady: function () {
         return this.ws &&
             this.ws.readyState === WebSocket.OPEN &&
             this.isAuthenticated;
@@ -1242,7 +1245,7 @@ Ext.define('Vectura.PubSub', {
      * Gets the current connection status.
      * @return {String} The status
      */
-    getStatus: function() {
+    getStatus: function () {
         if (!this.ws) return 'disconnected';
 
         switch (this.ws.readyState) {
@@ -1263,7 +1266,7 @@ Ext.define('Vectura.PubSub', {
      * Returns subscribed channels.
      * @return {Array} Array of channel names
      */
-    getSubscribedChannels: function() {
+    getSubscribedChannels: function () {
         return Ext.Array.from(this.subscriptions);
     },
 
@@ -1272,14 +1275,14 @@ Ext.define('Vectura.PubSub', {
      * @param {String} channel The channel
      * @return {Boolean} True if subscribed
      */
-    hasSubscription: function(channel) {
+    hasSubscription: function (channel) {
         return this.subscriptions.has(channel);
     },
 
     /**
      * Cleans up token refresh timer.
      */
-    cleanupTokenRefresh: function() {
+    cleanupTokenRefresh: function () {
         if (this.tokenRefreshTimer) {
             Ext.undefer(this.tokenRefreshTimer);
             this.tokenRefreshTimer = null;
@@ -1289,7 +1292,7 @@ Ext.define('Vectura.PubSub', {
     /**
      * Destroys the instance.
      */
-    destroy: function() {
+    destroy: function () {
         this.cleanupTokenRefresh();
         this.disconnect();
         this.callParent();

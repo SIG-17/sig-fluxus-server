@@ -273,11 +273,11 @@ class DbProcessor implements RpcInternalPorcessorInterface
             if ($workerId === false) {
                 $this->logger?->info("Master process es el coordinador de Health. Iniciando ciclo.");
                 $server->registerRpcMethod(
-                    method: $prefix.'.failures.retry.task',
+                    method: $prefix . '.failures.retry.task',
                     handler: function ($params, $fd) use ($server, $prefix) {
                         $taskData = [
                             'type' => 'broadcast_task',
-                            'method' => $prefix.'.failures.retry',
+                            'method' => $prefix . '.failures.retry',
                             'broadcast_to_all' => true,
                             'timestamp' => time()
                         ];
@@ -311,20 +311,28 @@ class DbProcessor implements RpcInternalPorcessorInterface
     private function notifyToWorkers(array $failures, Fluxus $server): void
     {
         $prefix = $this->methodPrefix;
-        $this->logger?->debug('Changes on DB connections detected: ' . implode(', ', ($failures)));
+        $changes = $failures['data']['recovery_result'];
+        // $this->logger?->debug('Changes on DB connections detected: ' . implode(', ', ($failures['data'])));
         /*
          *
-                'recovered_count' => $result['recovered'],
-                'timestamp' => time(),
-                'source_worker' => 0
+                [
+                            'worker_id' => $workerId,
+                            'recovery_result' => [
+                                'recovered' => count($result['pools_up']),
+                                'failed' => count($result['pools_down']),
+                                'unchanged' => count($result['pools_unchanged'])
+                            ],
+                            'timestamp' => time()
+                        ]
          */
-        $this->logger->info("✅ Master process recuperó {$failures['recovered']} conexiones. Notificando a todos los workers.");
+        $total = $changes['recovered'] + $changes['failed'];
+        $this->logger->info("🔄 Se detectaron cambios en el estado de $total conexiones. Notificando a todos los workers.");
 
 
         // **OPCIÓN A: Usar sendMessage (para workers normales) - RECOMENDADA**
         $message = json_encode([
             'action' => 'rpc',
-            'method' => $prefix.'.failures.retry',
+            'method' => $prefix . '.failures.retry',
             'params' => [],
             'source_fd' => 0,
             'source_worker' => -1,
@@ -362,41 +370,41 @@ class DbProcessor implements RpcInternalPorcessorInterface
         $methods = MethodsCollection::fromArray(
             [
                 [
-                    'method' => $prefix.'.statement.list',
+                    'method' => $prefix . '.statement.list',
                     'description' => 'Db descriptors list',
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:user'],
                     'only_internal' => false,
                     'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
-                        return $server->getInternalRpcProcessor('db')?->process($prefix.'.statement.list', $params);
+                        return $server->getInternalRpcProcessor('db')?->process($prefix . '.statement.list', $params);
                     }
                 ],
                 [
-                    'method' => $prefix.'.statement.info',
+                    'method' => $prefix . '.statement.info',
                     'description' => 'Db statement info',
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:admin', 'ws:user'],
                     'only_internal' => true,
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($prefix){
+                    'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
                         if (!isset($params['cfg'])) {
                             throw new InvalidArgumentException('{db.statement.info}  "cfg" is required for this method');
                         }
-                        return $server->getInternalRpcProcessor('db')?->process($prefix.'.statement.info', $params);
+                        return $server->getInternalRpcProcessor('db')?->process($prefix . '.statement.info', $params);
                     }
                 ],
                 [
-                    'method' => $prefix.'.processor',
+                    'method' => $prefix . '.processor',
                     'description' => 'Database processor for Statements',
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:admin', 'ws:user'],
                     'only_internal' => true,
                     'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
                         $server->logger->debug("DB request received from: " . $fd);
-                        return $server->getInternalRpcProcessor('db')?->process($prefix.'.processor', $params);
+                        return $server->getInternalRpcProcessor('db')?->process($prefix . '.processor', $params);
                     }
                 ],
                 [
-                    'method' => $prefix.'.pool.stats',
+                    'method' => $prefix . '.pool.stats',
                     'description' => 'DB Pool stats',
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:admin', 'ws:user'],
@@ -413,7 +421,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     }
                 ],
                 [
-                    'method' => $prefix.'.pool.stats.all',
+                    'method' => $prefix . '.pool.stats.all',
                     'description' => 'DB Pool stats for all workers',
                     'requires_auth' => true,
                     'allowed_roles' => ['ws:admin'],
@@ -438,7 +446,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
 
                         // 1. Guardar respuesta local
                         $localHealth = [];
-                        $handler = $prefix.'.pool.health';
+                        $handler = $prefix . '.pool.health';
                         if (isset($server->rpcHandlers[$handler])) {
                             try {
                                 $localHealth = $server->rpcHandlers[$handler]($server, [], $fd);
@@ -533,7 +541,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     }
                 ],
                 [
-                    'method' => $prefix.'.failures.retry',
+                    'method' => $prefix . '.failures.retry',
                     'description' => 'Forces retry of permanent failures in the database connection pool',
                     'requires_auth' => true,
                     'only_internal' => true,
@@ -548,7 +556,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     }
                 ],
                 [
-                    'method' => $prefix.'.failures.retry.task',
+                    'method' => $prefix . '.failures.retry.task',
                     'description' => 'Forces retry of permanent failures in ALL workers',
                     'requires_auth' => true,
                     'allowed_roles' => ['ws:admin'],
@@ -556,7 +564,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
                         $taskData = [
                             'type' => 'broadcast_task',
-                            'method' => $prefix.'.failures.retry',
+                            'method' => $prefix . '.failures.retry',
                             'broadcast_to_all' => true,
                             'timestamp' => time()
                         ];
@@ -572,7 +580,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                 ],
                 [
 
-                    'method' => $prefix.'.failures.retry.broadcast',
+                    'method' => $prefix . '.failures.retry.broadcast',
                     'description' => 'Forces retry of permanent failures in ALL workers',
                     'requires_auth' => true,
                     'allowed_roles' => ['ws:admin'],
@@ -593,7 +601,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                         // **OPCIÓN A: Usar sendMessage (para workers normales) - RECOMENDADA**
                         $message = json_encode([
                             'action' => 'rpc',
-                            'method' => $prefix.'.failures.retry',
+                            'method' => $prefix . '.failures.retry',
                             'params' => [],
                             'source_fd' => $fd,
                             'source_worker' => $workerId,
@@ -634,7 +642,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
             $healthManager = $this->healthManager;
             $methods->add(
                 [
-                    'method' => $prefix.'.health.status',
+                    'method' => $prefix . '.health.status',
                     'description' => 'DB Connector health status',
                     'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager) {
                         return [
@@ -646,7 +654,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     }
                 ]);
             $methods->add([
-                'method' => $prefix.'.health.history',
+                'method' => $prefix . '.health.history',
                 'description' => 'DB Connector health checks history',
                 'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager) {
                     return [
@@ -658,7 +666,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                 }
             ]);
             $methods->add([
-                'method' => $prefix.'.health.check.now',
+                'method' => $prefix . '.health.check.now',
                 'description' => 'DB Connector health check',
                 'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager, $logger) {
                     $logger->info("Forcing health check from client {$fd}");

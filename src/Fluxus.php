@@ -295,6 +295,7 @@ class Fluxus extends Server
         $this->rpcMethods->column('registered_at', Table::TYPE_INT);
         $this->rpcMethods->column('allowed_roles', Table::TYPE_STRING, 4096);
         $this->rpcMethods->column('only_internal', Table::TYPE_INT, 1);
+        $this->rpcMethods->column('coroutine', Table::TYPE_INT, 1);
         $this->rpcMethods->create();
         while ($config = array_shift($this->rpcMethodsQueue)) {
             $this->registerRpcMethod(...$config);
@@ -452,7 +453,7 @@ class Fluxus extends Server
         }
 
         $handled = true;
-        $this->logger?->info("Recibido signal {$signal}, cerrando servidor...");
+        $this->logger?->info("Recibido signal {$signal}, cerrando servidor inmediatamente...");
         $this->shutdown();
     }
 
@@ -546,7 +547,7 @@ class Fluxus extends Server
     private function cleanUpRpcProcessors(string $logPrefix = '🛑'): void
     {
         $workerId = $this->getWorkerId() ?? $this->workerId;
-        $this->logger?->debug("$logPrefix Worker #$workerId: Limpiando procesadores RPC...".var_export($workerId, true));
+        $this->logger?->debug("$logPrefix Worker #$workerId: Limpiando procesadores RPC..." . var_export($workerId, true));
         foreach ($this->rpcInternalProcessors as $processor) {
             if ($processor instanceof RpcInternalPorcessorInterface) {
                 $processor->deInit($this);
@@ -1397,9 +1398,152 @@ class Fluxus extends Server
     }
 
     /**
+     * Ejecuta un método RPC en una corutina separada con timeout
+     */
+    public function executeRpcMethod(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId, bool $coroutine = true): void
+    {
+        if (!$coroutine) {
+            $this->executeRpcMethodInline($fd, $requestId, $method, $params, $timeout, $workerId);
+            return;
+        }
+        $timeoutMs = $timeout * 1000;
+        // Crear coroutine para ejecutar el RPC
+        $coroutineId = Coroutine::create(function () use ($fd, $requestId, $method, $params, $timeoutMs, $workerId) {
+            try {
+                $this->logger?->debug("▶️  Iniciando coroutine para RPC en worker #{$workerId}: $method (ID: $requestId)" . ($timeoutMs > 0 ? " con timeout de {$timeoutMs}ms" : ""));
+
+                // Verificar que el método existe
+                if (!isset($this->rpcHandlers[$method])) {
+                    $this->logger?->error("💥 Método desapareció durante ejecución en worker #{$workerId}: $method");
+                    $this->sendRpcError($fd, $requestId, "Error interno: método no disponible", 500);
+                    $this->updateRpcRequest($requestId, 'failed');
+                    return;
+                }
+
+                // Actualizar estado a procesando
+                $this->updateRpcRequest($requestId, 'processing');
+
+                $startTime = microtime(true);
+                $handler = $this->rpcHandlers[$method];
+
+                $result = null;
+                $timedOut = false;
+
+                // Si hay timeout, usar un temporizador
+                if ($timeoutMs > 0) {
+                    $timeoutChannel = new Channel(1);
+                    $timeoutTimerId = swoole_timer_after($timeoutMs, function () use (&$timedOut, $timeoutChannel, $requestId, $workerId) {
+                        $timedOut = true;
+                        $this->logger?->warning("⏰ Timeout alcanzado para RPC $requestId en worker #$workerId");
+                        $timeoutChannel->push(true);
+                    });
+
+                    // Ejecutar handler en otra coroutine
+                    Coroutine::create(function () use ($handler, $params, $fd, $timeoutChannel) {
+                        try {
+                            $result = $handler($this, $params, $fd);
+                            $timeoutChannel->push(['result' => $result, 'success' => true]);
+                        } catch (\Exception $e) {
+                            $timeoutChannel->push(['error' => $e, 'success' => false]);
+                        }
+                    });
+
+                    // Esperar resultado o timeout
+                    $channelResult = $timeoutChannel->pop();
+
+                    // Cancelar timer si aún está activo
+                    if ($timeoutTimerId && swoole_timer_exists($timeoutTimerId)) {
+                        swoole_timer_clear($timeoutTimerId);
+                    }
+
+                    if ($timedOut) {
+                        throw new \RuntimeException("Timeout de {$timeoutMs}ms alcanzado para método {$method}");
+                    }
+
+                    if ($channelResult['success'] === false) {
+                        throw $channelResult['error'];
+                    }
+
+                    $result = $channelResult['result'];
+                } else {
+                    // Sin timeout
+                    $result = $handler($this, $params, $fd, $requestId);
+                }
+
+                $executionTime = round((microtime(true) - $startTime) * 1000, 2);
+
+                // Agregar metadata al resultado
+                if (is_array($result)) {
+                    if (!isset($result['_metadata'])) {
+                        $result['_metadata'] = [];
+                    }
+                    $result['_metadata'] = array_merge($result['_metadata'], [
+                        'execution_time_ms' => $executionTime,
+                        'worker_id' => $workerId,
+                        'request_id' => $requestId,
+                        'executed_in_coroutine' => true,
+                        'timeout_ms' => $timeoutMs
+                    ]);
+                }
+
+                // Enviar resultado
+                $this->sendRpcResult($fd, $requestId, $result, $executionTime);
+                $this->updateRpcRequest($requestId, 'completed');
+
+                $this->logger?->debug("✅ RPC completado en coroutine worker #{$workerId}: $method en {$executionTime}ms");
+
+            } catch (\Exception $e) {
+                $this->logger?->error("❌ Error ejecutando RPC en coroutine worker #{$workerId}: " . $e->getMessage());
+                $this->sendRpcError($fd, $requestId, $e->getMessage());
+                $this->updateRpcRequest($requestId, 'failed');
+            } finally {
+                // Limpiar si es necesario
+                $this->cleanupCoroutineResources($requestId);
+            }
+        });
+        // Registrar la coroutine para poder cancelarla si es necesario
+        $this->trackRpcCoroutine($requestId, $coroutineId);
+
+        $this->logger?->debug("🚀 Coroutine creada para RPC $requestId (CID: $coroutineId)");
+    }
+
+    /**
+     * Registra una coroutine RPC para poder gestionarla
+     */
+    private function trackRpcCoroutine(string $requestId, int $coroutineId): void
+    {
+        $this->cancelableCids[] = $coroutineId;
+
+        // Opcional: almacenar en tabla para mejor gestión
+        if ($this->rpcRequests->exist($requestId)) {
+            $request = $this->rpcRequests->get($requestId);
+            $request['coroutine_id'] = $coroutineId;
+            $this->rpcRequests->set($requestId, $request);
+        }
+    }
+
+    /**
+     * Limpia recursos de la coroutine
+     */
+    private function cleanupCoroutineResources(string $requestId): void
+    {
+        // Eliminar de la lista de cancelables
+        if ($this->rpcRequests->exist($requestId)) {
+            $request = $this->rpcRequests->get($requestId);
+            if (isset($request['coroutine_id'])) {
+                $coroutineId = $request['coroutine_id'];
+                $this->cancelableCids = array_filter(
+                    $this->cancelableCids,
+                    fn($cid) => $cid !== $coroutineId
+                );
+            }
+        }
+    }
+
+    /**
      * Ejecuta un método RPC en una corutina
      */
-    public function executeRpcMethod(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
+    private function executeRpcMethodInline(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
     {
         try {
             $this->logger?->debug("▶️  Ejecutando RPC en worker #{$workerId}: $method (ID: $requestId)");
@@ -1419,7 +1563,7 @@ class Fluxus extends Server
 
             try {
                 // Ejecutar handler
-                $result = $handler($this, $params, $fd);
+                $result = $handler($this, $params, $fd, $requestId);
                 $executionTime = round((microtime(true) - $startTime) * 1000, 2);
                 // Agregar metadata al resultado
                 if (is_array($result)) {
@@ -1461,7 +1605,8 @@ class Fluxus extends Server
         bool     $requires_auth = false,
         array    $allowed_roles = ['ws:general'],
         string   $description = '',
-        bool     $only_internal = false
+        bool     $only_internal = false,
+        bool     $coroutine = true
     ): bool
     {
         $workerId = $this->getWorkerId();
@@ -1491,6 +1636,7 @@ class Fluxus extends Server
                 'allowed_roles' => $roles,
                 'registered_by_worker' => $workerId,
                 'only_internal' => $only_internal ? 1 : 0,
+                'coroutine' => $coroutine ? 1 : 0,
                 'registered_at' => time()
             ]);
             $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method para los roles $roles");

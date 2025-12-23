@@ -698,12 +698,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/Tabula17/satelles-utilis-proelio.git",
-                "reference": "52ef77eb59dacd84443bc8a19e8408fe82758725"
+                "reference": "33abb79705a1b0c0cd65e5bad1d2de65f2083730"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/Tabula17/satelles-utilis-proelio/zipball/52ef77eb59dacd84443bc8a19e8408fe82758725",
-                "reference": "52ef77eb59dacd84443bc8a19e8408fe82758725",
+                "url": "https://api.github.com/repos/Tabula17/satelles-utilis-proelio/zipball/33abb79705a1b0c0cd65e5bad1d2de65f2083730",
+                "reference": "33abb79705a1b0c0cd65e5bad1d2de65f2083730",
                 "shasum": "",
                 "mirrors": [
                     {
@@ -759,7 +759,7 @@
                 "source": "https://github.com/Tabula17/satelles-utilis-proelio/tree/main",
                 "issues": "https://github.com/Tabula17/satelles-utilis-proelio/issues"
             },
-            "time": "2025-12-22T19:47:16+00:00"
+            "time": "2025-12-23T03:34:21+00:00"
         }
     ],
     "packages-dev": [
@@ -802,12 +802,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/Tabula17/satelles-omnia-roga.git",
-                "reference": "ecc95768e3df5b29eddcb5f14efe9c1a6e3d193a"
+                "reference": "b8cdce0b0d136cbed3d79352739b30c71af016ec"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/Tabula17/satelles-omnia-roga/zipball/ecc95768e3df5b29eddcb5f14efe9c1a6e3d193a",
-                "reference": "ecc95768e3df5b29eddcb5f14efe9c1a6e3d193a",
+                "url": "https://api.github.com/repos/Tabula17/satelles-omnia-roga/zipball/b8cdce0b0d136cbed3d79352739b30c71af016ec",
+                "reference": "b8cdce0b0d136cbed3d79352739b30c71af016ec",
                 "shasum": "",
                 "mirrors": [
                     {
@@ -868,7 +868,7 @@
                 "source": "https://github.com/Tabula17/satelles-omnia-roga/tree/main",
                 "issues": "https://github.com/Tabula17/satelles-omnia-roga/issues"
             },
-            "time": "2025-12-23T02:39:11+00:00"
+            "time": "2025-12-23T12:41:24+00:00"
         }
     ],
     "aliases": [],

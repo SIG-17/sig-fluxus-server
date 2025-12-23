@@ -31,6 +31,7 @@ export default class VecturaPubSub extends EventTarget {
     MESSAGE_TYPE_FILE_AVAILABLE = 'file_available';
     MESSAGE_TYPE_FILE_RESPONSE = 'file_response';
     MESSAGE_TYPE_RPC_RESPONSE = 'rpc_response';
+    MESSAGE_TYPE_RPC_SUCCESS = 'rpc_success';
     MESSAGE_TYPE_RPC_ERROR = 'rpc_error';
     MESSAGE_TYPE_RPC_METHODS = 'rpc_methods_list';
     MESSAGE_TYPE_ERROR = 'error';
@@ -475,6 +476,7 @@ export default class VecturaPubSub extends EventTarget {
                 break;
             case this.MESSAGE_TYPE_RPC_ERROR:
             case this.MESSAGE_TYPE_RPC_RESPONSE:
+            case this.MESSAGE_TYPE_RPC_SUCCESS:
                 this.debug('RPC response received:', data);
                 this.handleRpcResponse(data);
                 break;
@@ -830,13 +832,13 @@ export default class VecturaPubSub extends EventTarget {
 
             case this.RPC_STATUS_COMPLETED:
                 this.debug(`RPC ${data.id} (${handler.method}) completed in ${Date.now() - handler.startTime}ms`);
-                handler.resolve(data.result);
+                handler.resolve(data.result || data.message);
                 this.rpcHandlers.delete(data.id);
                 this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_RPC_COMPLETED, {
                     detail: {
                         id: data.id,
                         method: handler.method,
-                        result: data.result,
+                        result: data.result || data.message,
                         execution_time: data._metadata?.execution_time,
                         timestamp: data._metadata?.timestamp
                     }
