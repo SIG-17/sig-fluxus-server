@@ -20,8 +20,10 @@ use Tabula17\Satelles\Omnia\Roga\Loader\XmlStatements;
 use Tabula17\Satelles\Utilis\Cache\RedisStorage;
 use Tabula17\Satelles\Utilis\Collection\TCPServerCollection;
 use Tabula17\Satelles\Utilis\Config\ConnectionConfig;
+use Tabula17\Satelles\Utilis\List\RedisList;
 use Tabula17\Satelles\Utilis\Log\Handler\MongoDbHandler;
 
+date_default_timezone_set('America/Argentina/Buenos_Aires');
 require __DIR__ . '/../vendor/autoload.php';
 
 /**
@@ -136,10 +138,15 @@ $loaderStorage = new XmlStatements(
         cacheManager: $cacheManager,
         logger: $logger
 );
-
+$healthHistory = new RedisList(
+        redisConfig: $redisConfig['hm-history'],
+        list: 'health:history',
+        prefix: $instance . ":",
+);
 $healthManager = new HealthManager(
         connector: $connector,
         checkInterval: 30000, // 30 segundos
+        storage: $healthHistory,
         logger: $logger
 );
 $db = new DbProcessor(
@@ -300,25 +307,83 @@ try {
                 'pid' => posix_getpid()
         ];
     });
-/*    if ($server->setting['task_worker_num'] > 0) {
+    /*    if ($server->setting['task_worker_num'] > 0) {
+            $server->registerRpcMethod(
+                    method: 'db.failures.retry.task',
+                    handler: function ($params, $fd) use ($server, $logger) {
+                        $workerId = $server->getWorkerId();
+
+                        // Enviar task a UN task worker (no especificar ID, Swole lo distribuye)
+                        $taskData = [
+                                'type' => 'broadcast_task',
+                                'method' => 'db.failures.retry',
+                                'broadcast_to_all' => true,
+                                'timestamp' => time()
+                        ];
+
+                        $taskId = $server->task($taskData);
+                        return [
+                                'status' => 'ok',
+                                'message' => 'Task de reconexión enviada',
+                                'task_id' => $taskId,
+                                'timestamp' => time()
+                        ];
+                    },
+                    requires_auth: true,
+                    allowed_roles: ['ws:admin'],
+                    description: 'Forces retry of permanent failures in ALL workers'
+            );
+        }
         $server->registerRpcMethod(
-                method: 'db.failures.retry.task',
-                handler: function ($params, $fd) use ($server, $logger) {
+                method: 'db.failures.retry.broadcast',
+                handler: function ($server, $params, $fd) use ($logger, $healthManager) {
                     $workerId = $server->getWorkerId();
+                    $logger->info("📡 Broadcast de reconexión iniciado por cliente {$fd} en worker #{$workerId}");
 
-                    // Enviar task a UN task worker (no especificar ID, Swole lo distribuye)
-                    $taskData = [
-                            'type' => 'broadcast_task',
+                    // Ejecutar localmente primero
+                    $localResult = [];
+                    try {
+                        // $localResult = $server->rpcHandlers['db.failures.retry']([], $fd);
+                        $localResult = $healthManager->performHealthChecks($workerId, true);
+                        $logger->info("✅ Reconexión ejecutada localmente en worker #{$workerId}");
+                    } catch (\Exception $e) {
+                        $logger->error("❌ Error en reconexión local: " . $e->getMessage());
+                    }
+
+                    // **OPCIÓN A: Usar sendMessage (para workers normales) - RECOMENDADA**
+                    $message = json_encode([
+                            'action' => 'rpc',
                             'method' => 'db.failures.retry',
-                            'broadcast_to_all' => true,
+                            'params' => [],
+                            'source_fd' => $fd,
+                            'source_worker' => $workerId,
+                            'request_id' => uniqid('broadcast_', true),
                             'timestamp' => time()
-                    ];
+                    ], JSON_THROW_ON_ERROR);
 
-                    $taskId = $server->task($taskData);
+                    $sentCount = 0;
+                    $totalWorkers = $server->setting['worker_num'] ?? 1;
+
+                    for ($i = 0; $i < $totalWorkers; $i++) {
+                        if ($i !== $workerId) {
+                            try {
+                                if ($server->sendMessage($message, $i)) {
+                                    $sentCount++;
+                                    $logger->debug("📨 Mensaje enviado al worker #{$i}");
+                                }
+                            } catch (\Exception $e) {
+                                $logger->warning("⚠️ No se pudo enviar al worker #{$i}: " . $e->getMessage());
+                            }
+                        }
+                    }
+
                     return [
                             'status' => 'ok',
-                            'message' => 'Task de reconexión enviada',
-                            'task_id' => $taskId,
+                            'message' => 'Comando de reconexión enviado a todos los workers',
+                            'local_executed' => !empty($localResult),
+                            'broadcasted_to' => $sentCount . ' workers',
+                            'total_workers' => $totalWorkers,
+                            'current_worker' => $workerId,
                             'timestamp' => time()
                     ];
                 },
@@ -326,109 +391,51 @@ try {
                 allowed_roles: ['ws:admin'],
                 description: 'Forces retry of permanent failures in ALL workers'
         );
-    }
-    $server->registerRpcMethod(
-            method: 'db.failures.retry.broadcast',
-            handler: function ($server, $params, $fd) use ($logger, $healthManager) {
-                $workerId = $server->getWorkerId();
-                $logger->info("📡 Broadcast de reconexión iniciado por cliente {$fd} en worker #{$workerId}");
+        $server->registerRpcMethod(
+                method: 'db.failures.retry',
+                handler: function ($server, $params, $fd) use ($logger, $healthManager) {
+                    $logger->info("Forcing retry permanent db failures from client {$fd}");
+                    return [
+                            'status' => 'ok',
+                            'message' => 'Health check executed',
+                            'results' => $healthManager->performHealthChecks($server->getWorkerId(), true),
+                            'timestamp' => time()
+                    ];
+                },
+                requires_auth: true,
+                allowed_roles: ['ws:admin'],
+                description: 'Forces retry of permanent failures in the database connection pool',
+                only_internal: true
+        )
+        $server->registerRpcMethod('db.health.status', function ($server, $params, $fd) use ($healthManager) {
+            return [
+                    'status' => 'ok',
+                    'health' => $healthManager->getHealthStatus(),
+                    'timestamp' => time(),
+                    'worker_id' => $server->getWorkerId()
+            ];
+        });;
+        $server->registerRpcMethod('db.health.history', function (Fluxus $server, $params, $fd) use ($healthManager) {
+            return [
+                    'status' => 'ok',
+                    'health' => $healthManager->getCheckHistory(), //$healthManager->getCheckHistory(),
+                    'timestamp' => time(),
+                    'worker_id' => $server->getWorkerId()
+            ];
+        });
 
-                // Ejecutar localmente primero
-                $localResult = [];
-                try {
-                    // $localResult = $server->rpcHandlers['db.failures.retry']([], $fd);
-                    $localResult = $healthManager->performHealthChecks($workerId, true);
-                    $logger->info("✅ Reconexión ejecutada localmente en worker #{$workerId}");
-                } catch (\Exception $e) {
-                    $logger->error("❌ Error en reconexión local: " . $e->getMessage());
-                }
-
-                // **OPCIÓN A: Usar sendMessage (para workers normales) - RECOMENDADA**
-                $message = json_encode([
-                        'action' => 'rpc',
-                        'method' => 'db.failures.retry',
-                        'params' => [],
-                        'source_fd' => $fd,
-                        'source_worker' => $workerId,
-                        'request_id' => uniqid('broadcast_', true),
-                        'timestamp' => time()
-                ], JSON_THROW_ON_ERROR);
-
-                $sentCount = 0;
-                $totalWorkers = $server->setting['worker_num'] ?? 1;
-
-                for ($i = 0; $i < $totalWorkers; $i++) {
-                    if ($i !== $workerId) {
-                        try {
-                            if ($server->sendMessage($message, $i)) {
-                                $sentCount++;
-                                $logger->debug("📨 Mensaje enviado al worker #{$i}");
-                            }
-                        } catch (\Exception $e) {
-                            $logger->warning("⚠️ No se pudo enviar al worker #{$i}: " . $e->getMessage());
-                        }
-                    }
-                }
-
-                return [
-                        'status' => 'ok',
-                        'message' => 'Comando de reconexión enviado a todos los workers',
-                        'local_executed' => !empty($localResult),
-                        'broadcasted_to' => $sentCount . ' workers',
-                        'total_workers' => $totalWorkers,
-                        'current_worker' => $workerId,
-                        'timestamp' => time()
-                ];
-            },
-            requires_auth: true,
-            allowed_roles: ['ws:admin'],
-            description: 'Forces retry of permanent failures in ALL workers'
-    );
-    $server->registerRpcMethod(
-            method: 'db.failures.retry',
-            handler: function ($server, $params, $fd) use ($logger, $healthManager) {
-                $logger->info("Forcing retry permanent db failures from client {$fd}");
-                return [
-                        'status' => 'ok',
-                        'message' => 'Health check executed',
-                        'results' => $healthManager->performHealthChecks($server->getWorkerId(), true),
-                        'timestamp' => time()
-                ];
-            },
-            requires_auth: true,
-            allowed_roles: ['ws:admin'],
-            description: 'Forces retry of permanent failures in the database connection pool',
-            only_internal: true
-    )
-    $server->registerRpcMethod('db.health.status', function ($server, $params, $fd) use ($healthManager) {
-        return [
-                'status' => 'ok',
-                'health' => $healthManager->getHealthStatus(),
-                'timestamp' => time(),
-                'worker_id' => $server->getWorkerId()
-        ];
-    });;
-    $server->registerRpcMethod('db.health.history', function (Fluxus $server, $params, $fd) use ($healthManager) {
-        return [
-                'status' => 'ok',
-                'health' => $healthManager->getCheckHistory(), //$healthManager->getCheckHistory(),
-                'timestamp' => time(),
-                'worker_id' => $server->getWorkerId()
-        ];
-    });
-
-    $server->registerRpcMethod('db.health.check.now', function ($server, $params, $fd) use ($logger, $healthManager) {
-        $logger->info("Forcing health check from client {$fd}");
-        // Ejecutar check inmediato
-        $poolHealth = $healthManager->performHealthChecks($server->getWorkerId());
-        return [
-                'status' => 'ok',
-                'message' => 'Health check executed',
-                'results' => ['env' => $healthManager->getHealthStatus(), 'pool' => $poolHealth],
-                'timestamp' => time()
-        ];
-    });
-    */
+        $server->registerRpcMethod('db.health.check.now', function ($server, $params, $fd) use ($logger, $healthManager) {
+            $logger->info("Forcing health check from client {$fd}");
+            // Ejecutar check inmediato
+            $poolHealth = $healthManager->performHealthChecks($server->getWorkerId());
+            return [
+                    'status' => 'ok',
+                    'message' => 'Health check executed',
+                    'results' => ['env' => $healthManager->getHealthStatus(), 'pool' => $poolHealth],
+                    'timestamp' => time()
+            ];
+        });
+        */
 
     $server->onAfter('start', function () use ($logger, $instance, $server, $pidFile) {
         // Guardar nuestro PID cuando el servidor inicie

@@ -8,6 +8,7 @@ use Psr\Log\LoggerInterface;
 use SIG\Server\Collection\MethodsCollection;
 use SIG\Server\Exception\InvalidArgumentException;
 use SIG\Server\Fluxus;
+use Swoole\Coroutine\Channel;
 use Tabula17\Satelles\Omnia\Roga\Database\Connector;
 use Tabula17\Satelles\Omnia\Roga\Database\DbConfig;
 use Tabula17\Satelles\Omnia\Roga\Database\DbConfigCollection;
@@ -31,6 +32,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
      * @param LoggerInterface|null $logger
      * @param LoggerInterface|null $db_logger
      * @param HealthManagerInterface|null $healthManager
+     * @param string $methodPrefix
      */
     public function __construct(
         public Connector                  $connector,
@@ -394,16 +396,16 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     }
                 ],
                 [
-                    'method' => $prefix.'.pool.health',
-                    'description' => 'DB Pool health status',
+                    'method' => $prefix.'.pool.stats',
+                    'description' => 'DB Pool stats',
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:admin', 'ws:user'],
                     'only_internal' => false,
                     'handler' => static function (Fluxus $server, $params, $fd) {
                         $db = $server->getInternalRpcProcessor('db');
                         return [
-                            'status' => 'ok',
-                            'database_health' => $db?->connector->getHealthStatus() ?? [],
+                            //'status' => 'ok',
+                            //'database_health' => $db?->connector->getHealthStatus() ?? [],
                             'pool_stats' => $db?->connector->getPoolStats() ?? [],
                             'timestamp' => time(),
                             'worker_id' => $server->getWorkerId()
@@ -411,8 +413,8 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     }
                 ],
                 [
-                    'method' => $prefix.'.pool.health.all',
-                    'description' => 'DB Pool health status for all workers',
+                    'method' => $prefix.'.pool.stats.all',
+                    'description' => 'DB Pool stats for all workers',
                     'requires_auth' => true,
                     'allowed_roles' => ['ws:admin'],
                     'only_internal' => false,
@@ -430,22 +432,23 @@ class DbProcessor implements RpcInternalPorcessorInterface
                         $server->collectResponses[$requestId] = [];
 
                         // Canal para esperar respuestas
-                        $responseChannel = new \Swoole\Coroutine\Channel(
+                        $responseChannel = new Channel(
                             $server->setting['worker_num'] ?? 4
                         );
 
                         // 1. Guardar respuesta local
                         $localHealth = [];
-                        if (isset($server->rpcHandlers[$prefix.'.pool.health'])) {
+                        $handler = $prefix.'.pool.health';
+                        if (isset($server->rpcHandlers[$handler])) {
                             try {
-                                $localHealth = $server->rpcHandlers[$prefix.'.pool.health']($server, [], $fd);
+                                $localHealth = $server->rpcHandlers[$handler]($server, [], $fd);
                             } catch (\Exception $e) {
                                 $localHealth = ['error' => $e->getMessage(), 'worker_id' => $workerId];
                             }
                         }
                         $server->collectResponses[$requestId][$workerId] = [
                             'data' => $localHealth,
-                            'success' => $localHealth['status'] === 'ok' ?? false,
+                            //'success' => $localHealth['status'] === 'ok' ?? false,
                             'timestamp' => $data['timestamp'] ?? time(),
                             'source_worker' => $workerId
                         ];
@@ -455,7 +458,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                         // 2. Enviar broadcast a otros workers
                         $message = json_encode([
                             'action' => 'broadcast_collect',
-                            'collect_action' => $prefix.'.pool.health',
+                            'collect_action' => $handler,
                             'request_id' => $requestId,
                             'response_to_worker' => $workerId,
                             'need_response' => true,
@@ -520,7 +523,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
 
                         return [
                             'status' => 'ok',
-                            'message' => 'Health recolectado',
+                            'message' => 'Pool Stats recolectado',
                             'request_id' => $requestId,
                             'summary' => $summary,
                             'data' => $allResults,
