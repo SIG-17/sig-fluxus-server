@@ -2282,4 +2282,82 @@ Ext.define('Vectura.PubSub', {
             countElement.innerHTML = 'Showing ' + visibleCount + ' methods';
         }
     },
+
+    /**
+     * Recarga métodos RPC desde el servidor.
+     */
+    reloadRpcMethods: function() {
+        var me = this;
+
+        me.loadRpcMethodsFromUrl().then(function() {
+            Ext.Msg.alert('Success', 'RPC methods reloaded successfully');
+
+            // Actualizar panel si está visible
+            var panel = Ext.ComponentQuery.query('panel[rpcDocPanel=true]')[0];
+            if (panel) {
+                me.generateRpcDocsHtml(panel);
+            }
+        }).catch(function(error) {
+            Ext.Msg.alert('Error', 'Failed to reload RPC methods: ' + error.message);
+        });
+    },
+
+
+    /**
+     * Ejecuta una prueba RPC.
+     * @private
+     * @param {Ext.window.Window} win Ventana
+     * @param {String} methodName Nombre del método
+     */
+    executeRpcTest: function(win, methodName) {
+        var me = this;
+        var form = win.down('form');
+        var params = {};
+
+        // Recolectar parámetros
+        var paramFields = form.getForm().getFields().items;
+        paramFields.each(function(field) {
+            if (field.name !== 'result' && field.getValue()) {
+                try {
+                    // Intentar parsear JSON para tipos complejos
+                    params[field.name] = Ext.decode(field.getValue());
+                } catch (e) {
+                    // Si falla, usar como string
+                    params[field.name] = field.getValue();
+                }
+            }
+        });
+
+        // Mostrar indicador de carga
+        var button = win.down('button[text=Execute]');
+        var originalText = button.text;
+        button.setText('Executing...');
+        button.disable();
+
+        // Ocultar resultado anterior
+        var resultField = form.down('textarea[name=result]');
+        resultField.hide();
+
+        // Ejecutar RPC
+        me.rpc(methodName, params).then(function(result) {
+            // Mostrar resultado
+            resultField.setValue(Ext.encode(result, true));
+            resultField.show();
+
+            Ext.Msg.notify('Success', 'RPC executed successfully');
+
+        }).catch(function(error) {
+            // Mostrar error
+            resultField.setValue('Error: ' + error.message);
+            resultField.show();
+
+            Ext.Msg.alert('Error', 'RPC execution failed: ' + error.message);
+
+        }).always(function() {
+            // Restaurar botón
+            button.setText(originalText);
+            button.enable();
+        });
+    },
+
 });
