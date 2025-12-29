@@ -6,9 +6,11 @@ use JsonException;
 use PDO;
 use Psr\Log\LoggerInterface;
 use SIG\Server\Collection\MethodsCollection;
+use SIG\Server\Config\MethodConfig;
 use SIG\Server\Exception\InvalidArgumentException;
 use SIG\Server\Fluxus;
 use Swoole\Coroutine\Channel;
+use Tabula17\Satelles\Omnia\Roga\Collection\StatementCollection;
 use Tabula17\Satelles\Omnia\Roga\Database\Connector;
 use Tabula17\Satelles\Omnia\Roga\Database\DbConfig;
 use Tabula17\Satelles\Omnia\Roga\Database\DbConfigCollection;
@@ -84,8 +86,17 @@ class DbProcessor implements RpcInternalPorcessorInterface
      * @throws StatementExecutionException
      * @throws JsonException
      */
-    private function dbProcessor(array $params): array
+    private function dbProcessor(string $cfg, mixed $variant = "*", string $variantMember = 'variant', array $params = []): array
     {
+        if (!in_array($variantMember, StatementCollection::$metadataVariantKeywords, true)) {
+            throw new InvalidArgumentException('Variant member must be one of: ' . implode(', ', StatementCollection::$metadataVariantKeywords) . '.');
+        }
+
+        $params = [
+            'cfg' => $cfg,
+            'params' => $params,
+            $variantMember => $variant
+        ];
         /**
          * @var RequestDescriptor $request
          * @var StatementBuilder $builder
@@ -202,8 +213,18 @@ class DbProcessor implements RpcInternalPorcessorInterface
      * @throws ConfigException
      * @throws JsonException
      */
-    private function dbGetStatementFor(array $params): array
+    private function dbGetStatementFor(string $cfg, mixed $variant = "*", string $variantMember = 'variant', array $params = []): array
     {
+        if (!in_array($variantMember, StatementCollection::$metadataVariantKeywords, true)) {
+            throw new InvalidArgumentException('Variant member must be one of: ' . implode(', ', StatementCollection::$metadataVariantKeywords) . '.');
+        }
+
+        $params = [
+            'cfg' => $cfg,
+            'params' => $params,
+            $variantMember => $variant
+        ];
+
         /**
          * @var RequestDescriptor $request
          * @var StatementBuilder $builder
@@ -243,14 +264,15 @@ class DbProcessor implements RpcInternalPorcessorInterface
         return $this->connector->getPoolStats($params['name']);
     }
 
-    private function dbStatementList(array $params): array
+    private function dbStatementList(): array
     {
-        return $this->loaderStorage->listAvailableStatements();
+        $statements = $this->loaderStorage->listAvailableStatements();
+        return ['statements' => $statements, 'total' => count($statements)];
     }
 
-    private function dbStatementInfo(array $params): array
+    private function dbStatementInfo(string $cfg): array
     {
-        return $this->loaderStorage->getStatementInfo($params['cfg']);
+        return $this->loaderStorage->getStatementInfo($cfg);
     }
 
     public function init(Fluxus $server): void
@@ -271,33 +293,33 @@ class DbProcessor implements RpcInternalPorcessorInterface
             $logger = $server->logger ?? $this->logger;
             //$this->healthManager?->startHealthCheckCycle($server, $server->getWorkerId());
             if ($workerId === false) {
-                $this->logger?->info("Master process es el coordinador de Health. Iniciando ciclo.");
-                $server->registerRpcMethod(
-                    method: $prefix . '.failures.retry.task',
-                    handler: function ($params, $fd) use ($server, $prefix) {
-                        $taskData = [
-                            'type' => 'broadcast_task',
-                            'method' => $prefix . '.failures.retry',
-                            'broadcast_to_all' => true,
-                            'timestamp' => time()
-                        ];
-
-                        $taskId = $server->task($taskData);
-                        return [
-                            'status' => 'ok',
-                            'message' => 'Task de reconexión enviada',
-                            'task_id' => $taskId,
-                            'timestamp' => time()
-                        ];
-                    },
-                    requires_auth: true,
-                    allowed_roles: ['ws:admin'],
-                    description: 'Forces retry of permanent failures in ALL workers'
+                $logger?->info("Master process es el coordinador de Health. Iniciando ciclo.");
+                $server->registerRpcMethod(new MethodConfig([
+                        'method' => $prefix . '.failures.retry.task',
+                        'handler' => function () use ($server, $prefix) {
+                            $taskData = [
+                                'type' => 'broadcast_task',
+                                'method' => $prefix . '.failures.retry',
+                                'broadcast_to_all' => true,
+                                'timestamp' => time()
+                            ];
+                            $taskId = $server->task($taskData);
+                            return [
+                                'status' => 'ok',
+                                'message' => 'Task de reconexión enviada',
+                                'task_id' => $taskId,
+                                'timestamp' => time()
+                            ];
+                        },
+                        'requires_auth' => true,
+                        'allowed_roles' => ['ws:admin'],
+                        'description' => 'Forces retry of permanent failures in ALL workers'
+                    ])
                 );
                 $this->healthManager?->registerNotifier(function ($changes) use ($server) {
                     $this->notifyToWorkers($changes, $server);
                 });
-                $this->healthManager?->startHealthCheckCycle($server, $workerId);
+                $this->healthManager?->startHealthCheckCycle($server, false);
 
             } else {
                 $this->logger?->info("Worker #{$workerId} listo. Health checks a cargo del Master process.");
@@ -375,33 +397,129 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:user'],
                     'only_internal' => false,
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
-                        return $server->getInternalRpcProcessor('db')?->process($prefix . '.statement.list', $params);
-                    }
+                    'handler' => function () {
+                        return $this->dbStatementList();
+                    },
+                    'returns' => [
+                        'type' => 'array',
+                        'description' => 'Lista con los descriptores disponibles para genera consultas',
+                    ]
                 ],
                 [
                     'method' => $prefix . '.statement.info',
                     'description' => 'Db statement info',
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:admin', 'ws:user'],
-                    'only_internal' => true,
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
-                        if (!isset($params['cfg'])) {
+                    'only_internal' => false,
+                    'handler' => function (string $cfg) {
+                        if (!isset($cfg)) {
                             throw new InvalidArgumentException('{db.statement.info}  "cfg" is required for this method');
                         }
-                        return $server->getInternalRpcProcessor('db')?->process($prefix . '.statement.info', $params);
-                    }
+                        return $this->dbStatementInfo($cfg);
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'cfg',
+                            'type' => 'string',
+                            'required' => true,
+                            'description' => 'ID/Nombre del descriptor SQL',
+                        ]
+                    ],
+                    'returns' => [
+                        'type' => 'array',
+                    ]
+                ],
+
+                [
+                    'method' => $prefix . '.get.statement.for',
+                    'description' => 'Info form DB Statement descriptor',
+                    'requires_auth' => false,
+                    'allowed_roles' => ['ws:user'],
+                    'only_internal' => false,
+                    'handler' => function (string $cfg, mixed $variant = "*", string $variantMember = 'variant', array $params = []) use ($prefix, $logger) {
+                        if (!isset($cfg)) {
+                            throw new InvalidArgumentException('{' . $prefix . '.get.statement.for}  "cfg" is required for this method');
+                        }
+                        $logger?->debug("Buscando statement para {$cfg}");
+                        //db.get,statement.for
+                        return $this->dbGetStatementFor($cfg, $variant, $variantMember, $params);
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'cfg',
+                            'type' => 'string',
+                            'required' => true,
+                            'description' => 'ID/Nombre del descriptor SQL',
+                        ],
+                        [
+                            'name' => 'variant',
+                            'type' => 'int|string',
+                            'default' => '*',
+                            'required' => true,
+                            'description' => 'Variant to use for statement (default: * [any])',
+                        ],
+                        [
+                            'name' => 'variantMember',
+                            'type' => 'string',
+                            'default' => 'variant',
+                            'required' => true,
+                            'description' => 'Keyword to use for variant member (default: variant)',
+                            'enum' => StatementCollection::$metadataVariantKeywords
+                        ],
+                        [
+                            'name' => 'params',
+                            'type' => 'array',
+                            'required' => false,
+                            'description' => 'ParamName => Value pairs to use for statement parameters'
+                        ]
+                    ]
                 ],
                 [
                     'method' => $prefix . '.processor',
                     'description' => 'Database processor for Statements',
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:admin', 'ws:user'],
-                    'only_internal' => true,
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
-                        $server->logger->debug("DB request received from: " . $fd);
-                        return $server->getInternalRpcProcessor('db')?->process($prefix . '.processor', $params);
-                    }
+                    'only_internal' => false,
+                    'handler' => function (int $fd, string $cfg, mixed $variant = "*", string $variantMember = 'variant', array $params = []) use ($logger) {
+                        $logger->debug("DB request received from: " . $fd);
+                        return $this->dbProcessor($cfg, $variant, $variantMember, $params);
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'fd',
+                            'type' => 'int',
+                            'required' => true,
+                            'description' => 'Client FD',
+                            'injected' => true
+                        ],
+                        [
+                            'name' => 'cfg',
+                            'type' => 'string',
+                            'required' => true,
+                            'description' => 'ID/Nombre del descriptor SQL',
+                        ],
+                        [
+                            'name' => 'variant',
+                            'type' => 'int|string',
+                            'default' => '*',
+                            'required' => true,
+                            'description' => 'Variant to use for statement (default: * [any])',
+                        ],
+                        [
+                            'name' => 'variantMember',
+                            'type' => 'string',
+                            'default' => 'variant',
+                            'required' => true,
+                            'description' => 'Keyword to use for variant member (default: variant)',
+                            'enum' => StatementCollection::$metadataVariantKeywords
+                        ],
+                        [
+                            'name' => 'params',
+                            'type' => 'array',
+                            'required' => false,
+                            'description' => 'ParamName => Value pairs to use for statement parameters'
+                        ]
+                    ]
                 ],
                 [
                     'method' => $prefix . '.pool.stats',
@@ -409,16 +527,24 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     'requires_auth' => false,
                     'allowed_roles' => ['ws:admin', 'ws:user'],
                     'only_internal' => false,
-                    'handler' => static function (Fluxus $server, $params, $fd) {
-                        $db = $server->getInternalRpcProcessor('db');
+                    'handler' => function (int $workerId) {
                         return [
                             //'status' => 'ok',
                             //'database_health' => $db?->connector->getHealthStatus() ?? [],
-                            'pool_stats' => $db?->connector->getPoolStats() ?? [],
+                            'pool_stats' => $this->connector->getPoolStats() ?? [],
                             'timestamp' => time(),
-                            'worker_id' => $server->getWorkerId()
+                            'worker_id' => $workerId
                         ];
-                    }
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'workerId',
+                            'type' => 'int',
+                            'required' => true,
+                            'description' => 'Worker ID',
+                            'injected' => true
+                        ]
+                    ]
                 ],
                 [
                     'method' => $prefix . '.pool.stats.all',
@@ -426,10 +552,9 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     'requires_auth' => true,
                     'allowed_roles' => ['ws:admin'],
                     'only_internal' => false,
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
+                    'handler' => static function (Fluxus $server, $fd, $timeout = 1500) use ($prefix) {
                         $workerId = $server->getWorkerId();
                         $requestId = uniqid('health_all_', true);
-                        $timeout = $params['timeout'] ?? 1500;
 
                         $server->logger->info("📡 Recolectando health de TODOS los workers (Request: $requestId)");
 
@@ -538,14 +663,36 @@ class DbProcessor implements RpcInternalPorcessorInterface
                             'current_worker' => $workerId,
                             'timestamp' => time()
                         ];
-                    }
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'server',
+                            'type' => 'Fluxus',
+                            'required' => true,
+                            'description' => 'Fluxus server instance',
+                            'injected' => true
+                        ],
+                        [
+                            'name' => 'fd',
+                            'type' => 'int',
+                            'required' => true,
+                            'description' => 'Client FD',
+                            'injected' => true
+                        ],
+                        [
+                            'name' => 'timeout',
+                            'type' => 'int',
+                            'required' => false,
+                            'default' => 1500,
+                        ]
+                    ]
                 ],
                 [
                     'method' => $prefix . '.failures.retry',
                     'description' => 'Forces retry of permanent failures in the database connection pool',
                     'requires_auth' => true,
                     'only_internal' => true,
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($logger, $connector) {
+                    'handler' => static function (int $fd) use ($logger, $connector) {
                         $logger->info("Forcing retry permanent db failures from client {$fd}");
                         return [
                             'status' => 'ok',
@@ -553,7 +700,16 @@ class DbProcessor implements RpcInternalPorcessorInterface
                             'results' => $connector->retryFailedConnections(),
                             'timestamp' => time()
                         ];
-                    }
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'fd',
+                            'type' => 'int',
+                            'required' => true,
+                            'description' => 'Client FD',
+                            'injected' => true
+                        ]
+                    ]
                 ],
                 [
                     'method' => $prefix . '.failures.retry.task',
@@ -561,7 +717,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     'requires_auth' => true,
                     'allowed_roles' => ['ws:admin'],
                     'only_internal' => false,
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($prefix) {
+                    'handler' => static function (Fluxus $server) use ($prefix) {
                         $taskData = [
                             'type' => 'broadcast_task',
                             'method' => $prefix . '.failures.retry',
@@ -576,7 +732,16 @@ class DbProcessor implements RpcInternalPorcessorInterface
                             'task_id' => $taskId,
                             'timestamp' => time()
                         ];
-                    }
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'server',
+                            'type' => 'Fluxus',
+                            'required' => true,
+                            'description' => 'Fluxus server instance',
+                            'injected' => true
+                        ]
+                    ]
                 ],
                 [
 
@@ -585,7 +750,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
                     'requires_auth' => true,
                     'allowed_roles' => ['ws:admin'],
                     'only_internal' => false,
-                    'handler' => static function ($server, $params, $fd) use ($logger, $connector, $prefix) {
+                    'handler' => static function ($server, $fd) use ($logger, $connector, $prefix) {
                         $workerId = $server->getWorkerId();
                         $logger->info("📡 Broadcast de reconexión iniciado por cliente {$fd} en worker #{$workerId}");
                         // Ejecutar localmente primero
@@ -634,7 +799,23 @@ class DbProcessor implements RpcInternalPorcessorInterface
                             'current_worker' => $workerId,
                             'timestamp' => time()
                         ];
-                    }
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'server',
+                            'type' => 'Fluxus',
+                            'required' => true,
+                            'description' => 'Fluxus server instance',
+                            'injected' => true
+                        ],
+                        [
+                            'name' => 'fd',
+                            'type' => 'int',
+                            'required' => true,
+                            'description' => 'Client FD',
+                            'injected' => true
+                        ]
+                    ]
                 ]
             ]
         );
@@ -644,41 +825,75 @@ class DbProcessor implements RpcInternalPorcessorInterface
                 [
                     'method' => $prefix . '.health.status',
                     'description' => 'DB Connector health status',
-                    'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager) {
+                    'handler' => static function (int $workerId) use ($healthManager) {
                         return [
                             'status' => 'ok',
                             'health' => $healthManager->getHealthStatus(),
                             'timestamp' => time(),
-                            'worker_id' => $server->getWorkerId()
+                            'worker_id' => $workerId
                         ];
-                    }
+                    },
+                    'parameters' => [
+                        [
+                            'name' => 'workerId',
+                            'type' => 'int',
+                            'required' => true,
+                            'description' => 'Worker ID',
+                            'injected' => true
+                        ]
+                    ]
                 ]);
             $methods->add([
                 'method' => $prefix . '.health.history',
                 'description' => 'DB Connector health checks history',
-                'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager) {
+                'handler' => static function (int $workerId) use ($healthManager) {
                     return [
                         'status' => 'ok',
                         'health' => $healthManager->getCheckHistory(), //$healthManager->getCheckHistory(),
                         'timestamp' => time(),
-                        'worker_id' => $server->getWorkerId()
+                        'worker_id' => $workerId
                     ];
-                }
+                },
+                'parameters' => [
+                    [
+                        'name' => 'workerId',
+                        'type' => 'int',
+                        'required' => true,
+                        'description' => 'Worker ID',
+                        'injected' => true
+                    ]
+                ]
             ]);
             $methods->add([
                 'method' => $prefix . '.health.check.now',
                 'description' => 'DB Connector health check',
-                'handler' => static function (Fluxus $server, $params, $fd) use ($healthManager, $logger) {
+                'handler' => static function (int $workerId, int $fd) use ($healthManager, $logger) {
                     $logger->info("Forcing health check from client {$fd}");
                     // Ejecutar check inmediato
-                    $poolHealth = $healthManager->performHealthChecks($server->getWorkerId());
+                    $poolHealth = $healthManager->performHealthChecks($workerId);
                     return [
                         'status' => 'ok',
                         'message' => 'Health check executed',
                         'results' => ['env' => $healthManager->getHealthStatus(), 'pool' => $poolHealth],
                         'timestamp' => time()
                     ];
-                }
+                },
+                'parameters' => [
+                    [
+                        'name' => 'workerId',
+                        'type' => 'int',
+                        'required' => true,
+                        'description' => 'Worker ID',
+                        'injected' => true
+                    ],
+                    [
+                        'name' => 'fd',
+                        'type' => 'int',
+                        'required' => true,
+                        'description' => 'Client FD',
+                        'injected' => true
+                    ]
+                ]
             ]);
         }
         $workerId = $server->getWorkerId();

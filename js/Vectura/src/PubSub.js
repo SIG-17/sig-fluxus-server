@@ -114,7 +114,36 @@ Ext.define('Vectura.PubSub', {
          * @cfg {Number} tokenRefreshInterval
          * Token refresh interval in milliseconds.
          */
-        tokenRefreshInterval: 5 * 60 * 1000 // 5 minutes
+        tokenRefreshInterval: 5 * 60 * 1000, // 5 minutes
+        /**
+         * @cfg {String} rpcMethodsUrl
+         * URL para cargar métodos RPC desde endpoint HTTP.
+         */
+        rpcMethodsUrl: null,
+
+        /**
+         * @cfg {Boolean} loadRpcMethodsOnConnect
+         * Cargar métodos RPC automáticamente al conectar.
+         */
+        loadRpcMethodsOnConnect: true,
+
+        /**
+         * @cfg {Boolean} autoGenerateRpcStubs
+         * Generar stubs de métodos RPC automáticamente.
+         */
+        autoGenerateRpcStubs: true,
+
+        /**
+         * @cfg {Boolean} enableRpcNamespaces
+         * Habilitar namespaces para métodos RPC (ej: db.health.status).
+         */
+        enableRpcNamespaces: true,
+        /**
+         * A property to hold the base namespace for RPC (Remote Procedure Call).
+         * This is typically used to define a namespace for ensuring unique
+         * identification of RPC methods within a particular scope.
+         */
+        rpcBaseNamespace: null
     },
 
     /**
@@ -223,6 +252,9 @@ Ext.define('Vectura.PubSub', {
         this.channelCallbacks = new Map();
         this.pendingCallbacks = new Map();
         this.toResubscribe = new Set();
+        this.rpcMethodsMetadata = new Map(); // Almacena metadatos de métodos
+        this.rpcStubsGenerated = false;
+        this.rpcNamespaces = {}; // Almacena namespaces creados
 
         if (this.getVerbose()) {
             this.log = Ext.log.bind(Ext);
@@ -431,11 +463,27 @@ Ext.define('Vectura.PubSub', {
      * Called when authentication is successful.
      */
     onAuthenticated: function () {
+        const me = this
         this.isAuthenticated = true;
         this.log('Authenticated with Pub/Sub server');
-        this.fireEvent(this.EVENT_TYPE_READY, {
-            subscriptions: this.subscriptions
-        });
+        // Cargar métodos RPC si está configurado
+        if (me.getLoadRpcMethodsOnConnect() && me.getRpcMethodsUrl()) {
+            me.loadRpcMethodsFromUrl().then(function() {
+                me.fireEvent(me.EVENT_TYPE_READY, {
+                    subscriptions: me.subscriptions,
+                    rpcMethods: me.rpcMethodsMetadata
+                });
+            }).catch(function(error) {
+                me.warn('Failed to load RPC methods:', error);
+                me.fireEvent(me.EVENT_TYPE_READY, {
+                    subscriptions: me.subscriptions
+                });
+            });
+        } else {
+            me.fireEvent(me.EVENT_TYPE_READY, {
+                subscriptions: me.subscriptions
+            });
+        }
     },
 
     /**
@@ -1181,7 +1229,6 @@ Ext.define('Vectura.PubSub', {
     /**
      * Lists available RPC methods.
      * @return {Ext.Promise} Promise that resolves with the methods list
-     */
     listRpcMethods: function () {
         var me = this;
 
@@ -1203,7 +1250,240 @@ Ext.define('Vectura.PubSub', {
 
         return deferred.promise;
     },
+        */
+    /**
+     * Carga métodos RPC desde un endpoint HTTP.
+     * @param {String} url URL opcional (usa la configurada por defecto)
+     * @return {Ext.Promise} Promise que resuelve con la lista de métodos
+     */
+    loadRpcMethodsFromUrl: function(url) {
+        var me = this;
+        var targetUrl = url || me.getRpcMethodsUrl();
 
+        if (!targetUrl) {
+            return Ext.Promise.reject(new Error('No RPC methods URL specified'));
+        }
+
+        me.debug('Loading RPC methods from:', targetUrl);
+
+        return Ext.Ajax.request({
+            url: targetUrl,
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json'
+            }
+        }).then(function(response) {
+            var data = Ext.decode(response.responseText);
+
+            if (data.type !== 'rpc' || !Ext.isArray(data.methods)) {
+                throw new Error('Invalid RPC methods response');
+            }
+
+            // Almacenar metadatos
+            me.rpcMethodsMetadata.clear();
+            data.methods.forEach(function(method) {
+                me.rpcMethodsMetadata.set(method.method, method);
+            });
+
+            me.debug('Loaded ' + data.methods.length + ' RPC methods');
+
+            // Generar stubs automáticamente si está configurado
+            if (me.getAutoGenerateRpcStubs()) {
+                me.generateRpcStubs();
+            }
+
+            // Disparar evento
+            me.fireEvent(me.EVENT_TYPE_RPC_METHODS, data.methods);
+
+            return data.methods;
+
+        }).catch(function(error) {
+            me.error('Error loading RPC methods:', error);
+            throw error;
+        });
+    },
+
+    /**
+     * Genera funciones stub para todos los métodos RPC cargados.
+     */
+    generateRpcStubs: function() {
+        var me = this;
+
+        if (me.rpcStubsGenerated) {
+            me.debug('RPC stubs already generated');
+            return;
+        }
+
+        // Generar stubs para cada método
+        me.rpcMethodsMetadata.forEach(function(methodInfo, methodName) {
+            // Crear función para este método
+            me[methodName] = me.createRpcStubFunction(methodName, methodInfo);
+
+            // También crear versión con namespaces si está habilitado
+            if (me.getEnableRpcNamespaces() && methodName.includes('.')) {
+                me.createNamespacedRpcStub(methodName, methodInfo);
+            }
+        });
+
+        me.rpcStubsGenerated = true;
+        me.debug('Generated RPC stubs for ' + me.rpcMethodsMetadata.size + ' methods');
+    },
+
+    /**
+     * Crea una función stub individual para un método RPC.
+     * @private
+     * @param {String} methodName Nombre del método
+     * @param {Object} methodInfo Información del método
+     * @return {Function} Función stub
+     */
+    createRpcStubFunction: function(methodName, methodInfo) {
+        var me = this;
+
+        return function() {
+            var args = Ext.Array.from(arguments);
+            var params = {};
+
+            // Si es un solo argumento y es objeto, usarlo directamente
+            if (args.length === 1 && Ext.isObject(args[0]) && !Ext.isArray(args[0])) {
+                params = args[0];
+            }
+            // Si hay múltiples argumentos y conocemos los nombres de parámetros
+            else if (methodInfo.params && Ext.isArray(methodInfo.params) && methodInfo.params.length > 0) {
+                // Crear mapeo de parámetros por nombre
+                var paramMap = {};
+                methodInfo.params.forEach(function(param) {
+                    paramMap[param.name] = param;
+                });
+
+                var paramNames = methodInfo.params.map(function(p) {
+                    return p.name;
+                });
+
+                paramNames.forEach(function(paramName, index) {
+                    if (index < args.length) {
+                        params[paramName] = args[index];
+                    } else {
+                        // Usar valor por defecto si existe
+                        var paramDef = paramMap[paramName];
+                        if (paramDef && paramDef.default !== null) {
+                            params[paramName] = paramDef.default;
+                        }
+                    }
+                });
+            }
+            // Fallback: pasar todos los args como array
+            else if (args.length > 0) {
+                params = { args: args };
+            }
+
+            // Validar parámetros requeridos
+            var missingParams = me.validateRpcParameters(methodInfo, params);
+            if (missingParams.length > 0) {
+                return Ext.Promise.reject(new Error(
+                    'Missing required parameters for ' + methodName + ': ' + missingParams.join(', ')
+                ));
+            }
+
+            // Llamar al método RPC
+            return me.rpc(methodName, params);
+        };
+    },
+
+    /**
+     * Crea stubs namespaced (ej: client.db.health.status()).
+     * @private
+     * @param {String} fullName Nombre completo del método con puntos
+     * @param {Object} methodInfo Información del método
+     */
+    createNamespacedRpcStub: function(fullName, methodInfo) {
+        var me = this;
+        var parts = fullName.split('.');
+        var current = this.getRpcBaseNamespace() || me;
+        if (typeof current !== 'object') {
+            if (current === null) {
+                current = this;
+            }
+            if (typeof current === 'string') {
+                if(!window[current]) {
+                    window[current] = {};
+                }
+                current = window[current];
+            }
+        }
+
+        // Crear namespaces anidados
+        for (var i = 0; i < parts.length - 1; i++) {
+            var part = parts[i];
+
+            // Crear namespace si no existe
+            if (!current[part] || !Ext.isObject(current[part])) {
+                current[part] = {};
+            }
+            current = current[part];
+        }
+
+        // Asignar el método al último namespace
+        var methodName = parts[parts.length - 1];
+        current[methodName] = me.createRpcStubFunction(fullName, methodInfo);
+
+        // Registrar namespace
+        if (!me.rpcNamespaces[parts[0]]) {
+            me.rpcNamespaces[parts[0]] = {};
+        }
+    },
+
+    /**
+     * Valida los parámetros de un método RPC.
+     * @private
+     * @param {Object} methodInfo Información del método
+     * @param {Object} params Parámetros proporcionados
+     * @return {Array} Lista de parámetros requeridos faltantes
+     */
+    validateRpcParameters: function(methodInfo, params) {
+        var missing = [];
+
+        if (Ext.isArray(methodInfo.params)) {
+            methodInfo.params.forEach(function(param) {
+                if (param.required &&
+                    (params[param.name] === undefined || params[param.name] === null)) {
+                    missing.push(param.name);
+                }
+            });
+        }
+
+        return missing;
+    },
+
+    /**
+     * Obtiene información de un método RPC específico.
+     * @param {String} methodName Nombre del método
+     * @return {Object|null} Información del método
+     */
+    getRpcMethodInfo: function(methodName) {
+        return this.rpcMethodsMetadata.get(methodName);
+    },
+
+    /**
+     * Lista todos los métodos RPC disponibles.
+     * @return {Array} Lista de métodos
+     */
+    listRpcMethods: function() {
+        return Ext.Array.from(this.rpcMethodsMetadata.values());
+    },
+
+    /**
+     * Busca métodos RPC por nombre o descripción.
+     * @param {String} query Término de búsqueda
+     * @return {Array} Métodos que coinciden
+     */
+    searchRpcMethods: function(query) {
+        query = query.toLowerCase();
+
+        return Ext.Array.from(this.rpcMethodsMetadata.values()).filter(function(method) {
+            return method.method.toLowerCase().indexOf(query) !== -1 ||
+                method.description.toLowerCase().indexOf(query) !== -1;
+        });
+    },
     /**
      * Generates a unique request ID.
      * @return {String} The generated ID
@@ -1296,5 +1576,710 @@ Ext.define('Vectura.PubSub', {
         this.cleanupTokenRefresh();
         this.disconnect();
         this.callParent();
-    }
+    },
+    /**
+     * Crea campos de formulario para probar un método RPC con soporte para enum
+     * @private
+     * @param {Object} methodInfo Información del método
+     * @return {Array} Campos del formulario
+     */
+    createRpcTestFormFields: function(methodInfo) {
+        var fields = [];
+        var me = this;
+
+        // Descripción
+        fields.push({
+            xtype: 'component',
+            html: '<div style="padding: 10px; background: #f8f9fa; border-radius: 4px; margin-bottom: 15px;">' +
+                '<strong>' + methodInfo.method + '</strong><br/>' +
+                '<span style="color: #666;">' + methodInfo.description + '</span>' +
+                '</div>'
+        });
+
+        // Campos de parámetros
+        if (Ext.isArray(methodInfo.params) && methodInfo.params.length > 0) {
+            methodInfo.params.forEach(function(param) {
+                var hasEnum = param.enum && Ext.isArray(param.enum) && param.enum.length > 0;
+
+                var fieldConfig = {
+                    xtype: hasEnum ? 'combo' : 'textfield',
+                    fieldLabel: param.name,
+                    labelWidth: 120,
+                    allowBlank: !param.required,
+                    name: param.name,
+                    anchor: '100%',
+                    margin: '0 0 10 0',
+                    paramType: param.type,
+                    paramRequired: param.required
+                };
+
+                // Configuración específica para combos (enum)
+                if (hasEnum) {
+                    Ext.apply(fieldConfig, {
+                        xtype: 'combo',
+                        displayField: 'value',
+                        valueField: 'value',
+                        queryMode: 'local',
+                        triggerAction: 'all',
+                        editable: false,
+                        forceSelection: true,
+                        store: Ext.create('Ext.data.Store', {
+                            fields: ['value'],
+                            data: param.enum.map(function(value) {
+                                return { value: value };
+                            })
+                        }),
+                        emptyText: 'Select a value...'
+                    });
+
+                    // Establecer valor por defecto
+                    if (param.default !== null && param.default !== undefined) {
+                        fieldConfig.value = param.default;
+                    } else if (param.enum.length > 0) {
+                        fieldConfig.value = param.enum[0];
+                    }
+                } else {
+                    // Configuración para campos de texto normales
+                    fieldConfig.emptyText = param.example !== null ?
+                        'Example: ' + JSON.stringify(param.example) :
+                        param.default !== null ?
+                            'Default: ' + JSON.stringify(param.default) :
+                            'Enter value';
+
+                    // Establecer valor por defecto
+                    if (param.default !== null && param.default !== undefined) {
+                        fieldConfig.value = typeof param.default === 'string' ?
+                            param.default : JSON.stringify(param.default);
+                    }
+                }
+
+                // Añadir información de tipo
+                var typeLabel = '(' + param.type + (param.required ? ', required' : ', optional') + ')';
+                if (hasEnum) {
+                    typeLabel += ' - ' + param.enum.length + ' options';
+                }
+
+                fieldConfig.afterLabelTextTpl = [
+                    '<span style="color:#666;font-size:11px;margin-left:5px;">',
+                    typeLabel,
+                    '</span>'
+                ];
+
+                // Añadir tooltip con descripción
+                if (param.description) {
+                    fieldConfig.tooltip = param.description;
+                    fieldConfig.tooltipType = 'title';
+                }
+
+                // Añadir ayuda para enum
+                if (hasEnum && param.description) {
+                    fieldConfig.helpText = param.description +
+                        '<br/><strong>Allowed values:</strong> ' + param.enum.join(', ');
+                } else if (param.description) {
+                    fieldConfig.helpText = param.description;
+                }
+
+                fields.push(fieldConfig);
+
+                // Si tiene enum, añadir botones rápidos
+                if (hasEnum) {
+                    fields.push({
+                        xtype: 'container',
+                        layout: {
+                            type: 'hbox',
+                            pack: 'start',
+                            align: 'stretch'
+                        },
+                        margin: '0 0 15 120',
+                        defaults: {
+                            margin: '0 5px 0 0'
+                        },
+                        items: param.enum.map(function(value) {
+                            return {
+                                xtype: 'button',
+                                text: value,
+                                handler: function() {
+                                    var form = this.up('form');
+                                    var field = form.down('[name="' + param.name + '"]');
+                                    if (field) {
+                                        field.setValue(value);
+                                    }
+                                },
+                                tooltip: 'Set to: ' + value,
+                                scale: 'small'
+                            };
+                        })
+                    });
+                }
+            });
+        } else {
+            fields.push({
+                xtype: 'component',
+                html: '<div style="text-align: center; padding: 20px; color: #999; font-style: italic;">' +
+                    'No parameters required for this method.' +
+                    '</div>'
+            });
+        }
+
+        // Campo para resultado
+        fields.push({
+            xtype: 'textarea',
+            fieldLabel: 'Result',
+            labelWidth: 120,
+            name: 'result',
+            anchor: '100%',
+            height: 200,
+            readOnly: true,
+            margin: '20 0 0 0',
+            hidden: true,
+            fieldStyle: {
+                fontFamily: 'monospace',
+                fontSize: '12px'
+            }
+        });
+
+        return fields;
+    },
+    /**
+     * Genera HTML de documentación en un panel con soporte para enum
+     * @private
+     * @param {Ext.panel.Panel} panel Panel destino
+     */
+    generateRpcDocsHtml: function(panel) {
+        var me = this;
+        var methods = me.listRpcMethods();
+        var container = panel.down('#docsContainer').getEl();
+
+        if (methods.length === 0) {
+            container.setHtml('<div class="rpc-empty">No RPC methods available</div>');
+            return;
+        }
+
+        var html = [
+            '<div class="rpc-header">',
+            '<h2>Available RPC Methods (' + methods.length + ')</h2>',
+            '<p class="rpc-status">',
+            'Server: <strong>' + me.getUrl() + '</strong> | ',
+            'Status: <span class="rpc-status-badge ' + (me.isReady() ? 'connected' : 'disconnected') + '">',
+            me.isReady() ? 'Connected' : 'Disconnected',
+            '</span>',
+            '</p>',
+            '</div>',
+
+            '<div class="rpc-search-container">',
+            '<input type="text" id="rpc-search" placeholder="Search methods..." class="rpc-search-input">',
+            '<button id="clear-search" class="rpc-search-clear">Clear</button>',
+            '</div>',
+
+            '<div id="methods-count" class="methods-count">Showing ' + methods.length + ' methods</div>',
+
+            '<div class="rpc-methods-list">'
+        ];
+
+        methods.forEach(function(method, index) {
+            html.push(
+                '<div class="rpc-method" id="method-' + method.method.replace(/\./g, '-') + '" ' +
+                'data-name="' + method.method.toLowerCase() + '" ' +
+                'data-description="' + Ext.String.htmlEncode(method.description).toLowerCase() + '">',
+
+                '<div class="rpc-method-header">',
+                '<div class="method-title">',
+                '<h3>' + method.method + '</h3>',
+                '<div class="method-metadata">',
+                '<span class="method-id">#' + (index + 1) + '</span>',
+                '<span class="method-params">' + (method.params ? method.params.length : 0) + ' params</span>',
+                method.allow_guest ?
+                    '<span class="method-guest">Guest Allowed</span>' :
+                    '<span class="method-auth">Requires Auth</span>',
+                '</div>',
+                '</div>',
+                '<button class="rpc-test-btn" onclick="Ext.getCmp(\'' + panel.getId() + '\').testRpcMethod(\'' +
+                method.method + '\')">Test Method</button>',
+                '</div>',
+
+                '<p class="rpc-method-desc">' + Ext.String.htmlEncode(method.description) + '</p>'
+            );
+
+            if (Ext.isArray(method.params) && method.params.length > 0) {
+                html.push(
+                    '<div class="rpc-params">',
+                    '<h4>Parameters:</h4>',
+                    '<div class="params-grid">'
+                );
+
+                method.params.forEach(function(param) {
+                    var hasEnum = param.enum && Ext.isArray(param.enum) && param.enum.length > 0;
+
+                    html.push(
+                        '<div class="param-card' + (hasEnum ? ' has-enum' : '') + '">',
+                        '<div class="param-header">',
+                        '<strong>' + param.name + '</strong>',
+                        '<span class="param-type ' + (param.required ? 'required' : 'optional') + '">',
+                        param.type + (param.required ? ' *' : ''),
+                        '</span>',
+                        '</div>'
+                    );
+
+                    if (param.description) {
+                        html.push(
+                            '<div class="param-desc">' + Ext.String.htmlEncode(param.description) + '</div>'
+                        );
+                    }
+
+                    // Mostrar valores enum si existen
+                    if (hasEnum) {
+                        html.push(
+                            '<div class="param-enum">',
+                            '<div class="enum-label">Allowed values:</div>',
+                            '<div class="enum-values">'
+                        );
+
+                        param.enum.forEach(function(value) {
+                            html.push(
+                                '<span class="enum-value" title="Click to use this value" data-param="' + param.name + '" data-value="' +
+                                Ext.String.htmlEncode(value) + '">' + Ext.String.htmlEncode(value) + '</span>'
+                            );
+                        });
+
+                        html.push('</div></div>');
+                    }
+
+                    // Mostrar default y example
+                    html.push('<div class="param-details">');
+
+                    if (param.default !== null && param.default !== undefined) {
+                        html.push(
+                            '<div class="param-detail">',
+                            '<span class="detail-label">Default:</span>',
+                            '<span class="detail-value">' + Ext.String.htmlEncode(
+                                typeof param.default === 'string' ? param.default : JSON.stringify(param.default)
+                            ) + '</span>',
+                            '</div>'
+                        );
+                    }
+
+                    if (param.example !== null && param.example !== undefined) {
+                        html.push(
+                            '<div class="param-detail">',
+                            '<span class="detail-label">Example:</span>',
+                            '<span class="detail-value">' + Ext.String.htmlEncode(
+                                typeof param.example === 'string' ? param.example : JSON.stringify(param.example)
+                            ) + '</span>',
+                            '</div>'
+                        );
+                    }
+
+                    html.push('</div></div>');
+                });
+
+                html.push('</div></div>');
+            } else {
+                html.push('<p class="no-params">No parameters required</p>');
+            }
+
+            html.push('</div>');
+        });
+
+        html.push('</div>');
+
+        if (methods.length === 0) {
+            html.push(
+                '<div class="rpc-empty">',
+                '<p>No RPC methods available</p>',
+                '<button class="reload-btn" onclick="location.reload()">Reload Methods</button>',
+                '</div>'
+            );
+        }
+
+        container.setHtml(html.join(''));
+
+        // Añadir estilos CSS actualizados
+        if (!me.rpcDocsCssAdded) {
+            var css = [
+                '.rpc-docs-container { font-family: inherit; }',
+                '.rpc-empty { text-align: center; padding: 40px; color: #999; }',
+                '.rpc-header { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #eee; }',
+                '.rpc-header h2 { margin: 0 0 10px 0; color: #333; }',
+                '.rpc-status { margin: 0; color: #666; }',
+                '.rpc-status-badge { padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: bold; }',
+                '.rpc-status-badge.connected { background: #e6f7ff; color: #0366d6; border: 1px solid #91d5ff; }',
+                '.rpc-status-badge.disconnected { background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e; }',
+
+                '.rpc-search-container { margin: 15px 0; display: flex; gap: 10px; }',
+                '.rpc-search-input { flex: 1; padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; }',
+                '.rpc-search-clear { padding: 8px 16px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer; }',
+                '.methods-count { margin: 10px 0; color: #666; font-size: 14px; }',
+
+                '.rpc-methods-list { max-width: 100%; }',
+                '.rpc-method { border: 1px solid #e8e8e8; margin: 15px 0; padding: 20px; border-radius: 8px; background: white; }',
+                '.rpc-method-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }',
+                '.method-title { flex: 1; }',
+                '.rpc-method h3 { margin: 0; color: #0366d6; font-size: 16px; font-weight: 600; }',
+                '.method-metadata { display: flex; gap: 10px; font-size: 12px; color: #666; margin-top: 5px; }',
+                '.method-id, .method-params, .method-guest, .method-auth { padding: 1px 6px; border-radius: 3px; }',
+                '.method-guest { background: #e6f7ff; color: #0366d6; }',
+                '.method-auth { background: #fff1f0; color: #cf1322; }',
+
+                '.rpc-method-desc { margin: 0 0 15px 0; color: #666; line-height: 1.5; }',
+
+                '.rpc-params { margin: 15px 0; }',
+                '.rpc-params h4 { margin: 0 0 12px 0; font-size: 14px; color: #333; font-weight: 600; }',
+                '.params-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 15px; }',
+
+                '.param-card { border: 1px solid #e8e8e8; border-radius: 6px; padding: 15px; background: #fafafa; }',
+                '.param-card.has-enum { border-left: 4px solid #28a745; }',
+                '.param-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }',
+                '.param-type { font-size: 12px; padding: 2px 8px; border-radius: 10px; font-weight: 500; }',
+                '.param-type.required { background: #fff5f5; color: #dc3545; border: 1px solid #f5c6cb; }',
+                '.param-type.optional { background: #e6f7ff; color: #0366d6; border: 1px solid #91d5ff; }',
+
+                '.param-desc { color: #666; font-size: 13px; line-height: 1.4; margin-bottom: 10px; }',
+
+                '.param-enum { background: white; border: 1px solid #d1e7dd; border-radius: 4px; padding: 10px; margin: 10px 0; }',
+                '.enum-label { font-size: 12px; color: #0f5132; margin-bottom: 6px; font-weight: 500; }',
+                '.enum-values { display: flex; flex-wrap: wrap; gap: 5px; }',
+                '.enum-value { background: #d1e7dd; color: #0f5132; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; transition: all 0.2s; }',
+                '.enum-value:hover { background: #badbcc; transform: translateY(-1px); box-shadow: 0 2px 4px rgba(0,0,0,0.1); }',
+
+                '.param-details { margin-top: 10px; font-size: 12px; }',
+                '.param-detail { display: flex; margin-bottom: 4px; }',
+                '.detail-label { color: #666; min-width: 60px; }',
+                '.detail-value { color: #333; font-family: monospace; background: white; padding: 2px 6px; border-radius: 3px; border: 1px solid #e8e8e8; }',
+
+                '.no-params { color: #999; font-style: italic; text-align: center; padding: 20px; }',
+
+                '.rpc-test-btn { padding: 8px 16px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; }',
+                '.rpc-test-btn:hover { opacity: 0.9; }',
+
+                '.reload-btn { padding: 8px 16px; background: #0366d6; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; }',
+
+                /* Estilos para búsqueda */
+                '.rpc-method.hidden { display: none; }',
+                '.search-highlight { background: #fff3cd; padding: 0 2px; border-radius: 2px; }',
+
+                /* Responsive */
+                '@media (max-width: 768px) {',
+                '  .params-grid { grid-template-columns: 1fr; }',
+                '  .rpc-method-header { flex-direction: column; gap: 10px; }',
+                '  .rpc-test-btn { align-self: flex-start; }',
+                '}'
+            ].join(' ');
+
+            Ext.util.CSS.createStyleSheet(css, 'rpc-docs-styles');
+            me.rpcDocsCssAdded = true;
+        }
+
+        // Añadir funcionalidad de búsqueda
+        Ext.defer(function() {
+            var searchInput = container.dom.querySelector('#rpc-search');
+            var clearButton = container.dom.querySelector('#clear-search');
+            var methodsCount = container.dom.querySelector('#methods-count');
+            var methodElements = container.dom.querySelectorAll('.rpc-method');
+
+            if (searchInput) {
+                searchInput.addEventListener('input', function() {
+                    var query = this.value.toLowerCase().trim();
+                    var visibleCount = 0;
+
+                    methodElements.forEach(function(method) {
+                        var name = method.getAttribute('data-name');
+                        var description = method.getAttribute('data-description');
+
+                        if (query === '' || name.includes(query) || description.includes(query)) {
+                            method.classList.remove('hidden');
+                            visibleCount++;
+
+                            // Resaltar término de búsqueda
+                            if (query) {
+                                var text = method.textContent.toLowerCase();
+                                var regex = new RegExp('(' + query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+                                method.innerHTML = method.innerHTML.replace(regex, '<span class="search-highlight">$1</span>');
+                            }
+                        } else {
+                            method.classList.add('hidden');
+                        }
+                    });
+
+                    if (methodsCount) {
+                        methodsCount.textContent = 'Showing ' + visibleCount + ' of ' + methodElements.length + ' methods';
+                    }
+                });
+            }
+
+            if (clearButton) {
+                clearButton.addEventListener('click', function() {
+                    if (searchInput) {
+                        searchInput.value = '';
+                        searchInput.dispatchEvent(new Event('input'));
+                        searchInput.focus();
+                    }
+                });
+            }
+
+            // Manejar clicks en valores enum
+            container.dom.addEventListener('click', function(e) {
+                if (e.target.classList.contains('enum-value')) {
+                    var paramName = e.target.getAttribute('data-param');
+                    var value = e.target.getAttribute('data-value');
+
+                    // Mostrar mensaje usando ExtJS
+                    Ext.toast({
+                        html: 'Click "Test Method" and use <strong>' + value + '</strong> for ' + paramName,
+                        align: 't',
+                        slideInDuration: 300,
+                        slideBackDuration: 200,
+                        minWidth: 300,
+                        header: false
+                    });
+                }
+            });
+
+        }, 100);
+    },
+    /**
+     * Método de prueba para ser llamado desde los botones (actualizado para enum)
+     * @param {String} methodName Nombre del método a probar
+     */
+    testRpcMethod: function(methodName) {
+        var me = this;
+        var methodInfo = me.getRpcMethodInfo(methodName);
+
+        if (!methodInfo) {
+            Ext.Msg.alert('Error', 'Method ' + methodName + ' not found');
+            return;
+        }
+
+        // Crear ventana de prueba
+        var win = Ext.create('Ext.window.Window', {
+            title: 'Test RPC: ' + methodName,
+            width: 700,
+            height: 600,
+            modal: true,
+            layout: 'fit',
+            maximizable: true,
+
+            tools: [{
+                type: 'help',
+                tooltip: 'Method Info',
+                handler: function() {
+                    Ext.Msg.show({
+                        title: 'Method Information',
+                        message: '<strong>' + methodName + '</strong><br/><br/>' +
+                            '<strong>Description:</strong> ' + methodInfo.description + '<br/><br/>' +
+                            '<strong>Parameters:</strong> ' + (methodInfo.params ? methodInfo.params.length : 0) + '<br/>' +
+                            '<strong>Guest Access:</strong> ' + (methodInfo.allow_guest ? 'Yes' : 'No'),
+                        buttons: Ext.Msg.OK,
+                        icon: Ext.Msg.INFO
+                    });
+                }
+            }],
+
+            items: [{
+                xtype: 'form',
+                padding: 10,
+                layout: 'anchor',
+                scrollable: 'y',
+                autoScroll: true,
+
+                fieldDefaults: {
+                    labelWidth: 120,
+                    anchor: '100%',
+                    margin: '0 0 10 0'
+                },
+
+                items: me.createRpcTestFormFields(methodInfo),
+
+                buttons: [{
+                    text: 'Use Defaults',
+                    iconCls: 'x-fa fa-magic',
+                    handler: function() {
+                        var form = this.up('form');
+                        me.fillFormWithDefaults(form, methodInfo);
+                    }
+                }, {
+                    text: 'Clear',
+                    iconCls: 'x-fa fa-eraser',
+                    handler: function() {
+                        this.up('form').getForm().reset();
+                    }
+                }, '->', {
+                    text: 'Cancel',
+                    iconCls: 'x-fa fa-times',
+                    handler: function() {
+                        win.close();
+                    }
+                }, {
+                    text: 'Execute',
+                    formBind: true,
+                    iconCls: 'x-fa fa-play',
+                    handler: function() {
+                        me.executeRpcTest(win, methodName);
+                    }
+                }]
+            }]
+        });
+
+        win.show();
+    },
+
+    /**
+     * Llena el formulario con valores por defecto
+     * @private
+     * @param {Ext.form.Panel} form Formulario
+     * @param {Object} methodInfo Información del método
+     */
+    fillFormWithDefaults: function(form, methodInfo) {
+        var form = form.getForm();
+
+        if (Ext.isArray(methodInfo.params)) {
+            methodInfo.params.forEach(function(param) {
+                var field = form.findField(param.name);
+                if (field) {
+                    if (param.default !== null && param.default !== undefined) {
+                        field.setValue(param.default);
+                    } else if (param.enum && Ext.isArray(param.enum) && param.enum.length > 0) {
+                        // Para combos con enum, seleccionar el primer valor
+                        field.setValue(param.enum[0]);
+                    } else {
+                        // Valores por defecto basados en tipo
+                        switch(param.type.toLowerCase()) {
+                            case 'int':
+                            case 'integer':
+                                field.setValue(0);
+                                break;
+                            case 'bool':
+                            case 'boolean':
+                                field.setValue(false);
+                                break;
+                            case 'array':
+                                field.setValue('[]');
+                                break;
+                            case 'object':
+                                field.setValue('{}');
+                                break;
+                            default:
+                                field.setValue('');
+                        }
+                    }
+                }
+            });
+        }
+    },
+    /**
+     * Crea un componente de documentación RPC reutilizable
+     * @return {Ext.Component} Componente de documentación
+     */
+    createRpcDocumentationComponent: function() {
+        var me = this;
+
+        return Ext.create('Ext.panel.Panel', {
+            title: 'RPC Methods Documentation',
+            layout: 'fit',
+            scrollable: true,
+            padding: 10,
+            cls: 'rpc-docs-panel',
+
+            tools: [{
+                type: 'refresh',
+                tooltip: 'Reload Methods',
+                handler: function() {
+                    me.reloadRpcMethods();
+                }
+            }, {
+                type: 'search',
+                tooltip: 'Search Methods',
+                handler: function() {
+                    var panel = this.up('panel');
+                    var searchField = panel.down('#searchField');
+                    if (searchField) {
+                        searchField.focus();
+                    }
+                }
+            }],
+
+            items: [{
+                xtype: 'container',
+                layout: 'vbox',
+                items: [{
+                    xtype: 'container',
+                    layout: 'hbox',
+                    padding: '0 0 10 0',
+                    items: [{
+                        xtype: 'textfield',
+                        itemId: 'searchField',
+                        fieldLabel: 'Search',
+                        labelWidth: 60,
+                        emptyText: 'Type method name or description...',
+                        flex: 1,
+                        enableKeyEvents: true,
+                        listeners: {
+                            keyup: {
+                                fn: function(field) {
+                                    me.filterRpcMethods(field.getValue());
+                                },
+                                buffer: 300
+                            }
+                        }
+                    }, {
+                        xtype: 'button',
+                        text: 'Clear',
+                        margin: '0 0 0 5',
+                        handler: function() {
+                            var field = this.up('container').down('#searchField');
+                            if (field) {
+                                field.setValue('');
+                                me.filterRpcMethods('');
+                            }
+                        }
+                    }]
+                }, {
+                    xtype: 'component',
+                    itemId: 'docsContainer',
+                    autoEl: {
+                        tag: 'div',
+                        cls: 'rpc-docs-container'
+                    },
+                    flex: 1
+                }]
+            }],
+
+            afterRender: function() {
+                this.callParent(arguments);
+                me.generateRpcDocsHtml(this);
+            }
+        });
+    },
+
+    /**
+     * Filtra métodos RPC en la documentación
+     * @param {String} query Término de búsqueda
+     */
+    filterRpcMethods: function(query) {
+        var panel = Ext.ComponentQuery.query('panel[rpcDocPanel=true]')[0];
+        if (!panel) return;
+
+        var container = panel.down('#docsContainer');
+        if (!container) return;
+
+        var methods = container.getEl().select('.rpc-method');
+        var searchTerm = query.toLowerCase();
+
+        methods.each(function(method) {
+            var name = method.getAttribute('data-name').toLowerCase();
+            var description = method.getAttribute('data-description').toLowerCase();
+
+            if (searchTerm === '' || name.indexOf(searchTerm) !== -1 || description.indexOf(searchTerm) !== -1) {
+                method.setStyle('display', 'block');
+            } else {
+                method.setStyle('display', 'none');
+            }
+        });
+
+        // Actualizar contador
+        var visibleCount = container.getEl().select('.rpc-method:not([style*="display: none"])').elements.length;
+        var countElement = container.getEl().select('#methods-count').elements[0];
+        if (countElement) {
+            countElement.innerHTML = 'Showing ' + visibleCount + ' methods';
+        }
+    },
 });

@@ -306,6 +306,9 @@
             {
                 maxFileSize: 100 * 1024 * 1024,
                 maxReconnectAttempts: 15,
+                rpcMethodsUrl: '//127.0.0.1:9800/api/rpc-methods',
+                loadRpcMethodsOnConnect: true,
+                autoGenerateRpcStubs: true,
                 verbose: true
             }
         );
@@ -368,7 +371,7 @@
             }
             return ul;
         }
-        const processResults = {
+        const   processResults = {
                 'global.notifications': (data) => {
                     console.log('Notificaciones:', data);
                     const notification = document.createElement('div');
@@ -758,6 +761,7 @@
             rpcProcessors = {
                 'db': function (params, method) {
                     //['forceReload' =>$force, 'cfg' => 'Hr/deposito/Deposito', 'allowed' => 2, 'params' => ['warehouse_id' => 397]]
+                    console.debug('db:', params, method);
                     pubsub.rpc(`db.${method}`, params).then(result => {
                         console.log(`Resultado db.${method}:`, result);
                         const processor = processResults[`db.${method}`] || processResults['default'];
@@ -957,20 +961,20 @@
                     methods.forEach((method, index) => {
                         const li = document.createElement('li'),
                             button = document.createElement('a'),
-                            icon = resolveIcon(method.name, method.requires_auth);
+                            icon = resolveIcon(method.method, !method.allow_guest);
                         li.classList.add('pure-menu-item');
                         button.classList.add('button_rpc', 'button_rpc_' + index % 3, 'pure-menu-link');
                         button.href = '#';
-                        button.innerText = `${icon} ${method.name}`;
+                        button.innerText = `${icon} ${method.method}`;
                         button.title = method.description;
 
-                        if (method.name in rpcProcessors) {
+                        if (method.method in rpcProcessors) {
                             button.addEventListener('click', () => {
-                                rpcProcessors[method.name]();
+                                rpcProcessors[method.method]();
                             });
                         } else {
                             button.addEventListener('click', () => {
-                                rpcProcessors['default'](method.name, {});
+                                rpcProcessors['default'](method.method, {});
                             })
                         }
                         li.appendChild(button);

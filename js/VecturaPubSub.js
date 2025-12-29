@@ -84,8 +84,11 @@ export default class VecturaPubSub extends EventTarget {
             maxFileSize = 100 * 1024 * 1024,
             maxReconnectAttempts = 30,
             verbose = false,
-            allowGuest = true
-            // ... otras opciones=
+            allowGuest = true,
+            loadRpcMethodsOnConnect = true,
+            rpcMethodsUrl = null, // URL para cargar métodos (ej: '/api/rpc-methods')
+            autoGenerateRpcStubs = true,
+            rpcBaseNamespace = null
         } = options;
 
         super();
@@ -108,6 +111,13 @@ export default class VecturaPubSub extends EventTarget {
         this.reconnectDelay = 1000;
         this.toResubscribe = new Set();
         this.isManualClose = false;
+
+        this.loadRpcMethodsOnConnect = loadRpcMethodsOnConnect;
+        this.rpcMethodsUrl = rpcMethodsUrl;
+        this.autoGenerateRpcStubs = autoGenerateRpcStubs;
+        this.rpcMethodsMetadata = new Map(); // Almacena metadatos de métodos
+        this.rpcStubsGenerated = false;
+        this.rpcBaseNamespace = rpcBaseNamespace || this;
 
         if (verbose) {
             this.log = console.log.bind(console);
@@ -305,9 +315,23 @@ export default class VecturaPubSub extends EventTarget {
     onAuthenticated() {
         this.isAuthenticated = true;
         this.log('Authenticated with Pub/Sub server');
-        this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_READY, {
-            detail: {subscriptions: this.subscriptions}
-        }));
+
+        // Cargar métodos RPC si está configurado
+        if (this.loadRpcMethodsOnConnect && this.rpcMethodsUrl) {
+            this.loadRpcMethodsFromUrl().then(methods => {
+                this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_READY, {
+                    detail: {subscriptions: this.subscriptions, rpcMethods: methods}
+                }));
+            }).catch(error => {
+                this.warn('Failed to load RPC methods:', error);
+            });
+        } else {
+
+            this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_READY, {
+                detail: {subscriptions: this.subscriptions}
+            }));
+        }
+
 
         this.reconnectAttempts = 0;
         this.reconnectDelay = 1000;
@@ -434,6 +458,206 @@ export default class VecturaPubSub extends EventTarget {
                 error: error
             }));
         };
+    }
+
+    /**
+     * Carga métodos RPC desde un endpoint HTTP
+     */
+    async loadRpcMethodsFromUrl(url = null) {
+        const targetUrl = url || this.rpcMethodsUrl;
+
+        if (!targetUrl) {
+            throw new Error('No RPC methods URL specified');
+        }
+
+        try {
+            this.debug('Loading RPC methods from:', targetUrl);
+
+            const response = await fetch(targetUrl);
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+
+            if (data.type !== 'rpc' || !Array.isArray(data.methods)) {
+                throw new Error('Invalid RPC methods response');
+            }
+
+            // Almacenar metadatos
+            this.rpcMethodsMetadata.clear();
+            data.methods.forEach(method => {
+                this.rpcMethodsMetadata.set(method.method, method);
+            });
+
+            this.debug(`Loaded ${data.methods.length} RPC methods`);
+
+            // Generar stubs automáticamente si está configurado
+            if (this.autoGenerateRpcStubs) {
+                this.generateRpcStubs();
+            }
+
+            // Disparar evento
+            this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_RPC_METHODS, {
+                detail: data.methods
+            }));
+
+            return data.methods;
+
+        } catch (error) {
+            this.error('Error loading RPC methods:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Genera funciones stub para todos los métodos RPC cargados
+     */
+    generateRpcStubs() {
+        if (this.rpcStubsGenerated) {
+            this.debug('RPC stubs already generated');
+            return;
+        }
+
+        for (const [methodName, methodInfo] of this.rpcMethodsMetadata) {
+            // Crear función para este método
+            this[methodName] = this.createRpcStubFunction(methodName, methodInfo);
+
+            // También crear versión con namespaces (ej: "db.health.status")
+            if (methodName.includes('.')) {
+                this.createNamespacedRpcStub(methodName, methodInfo);
+            }
+        }
+
+        this.rpcStubsGenerated = true;
+        this.debug(`Generated RPC stubs for ${this.rpcMethodsMetadata.size} methods`);
+    }
+
+    /**
+     * Crea una función stub individual para un método RPC
+     */
+    createRpcStubFunction(methodName, methodInfo) {
+        return function (...args) {
+            let params = {};
+
+            // Si es un solo argumento y es objeto, usarlo directamente
+            if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null) {
+                params = args[0];
+            }
+            // Si hay múltiples argumentos y conocemos los nombres de parámetros
+            else if (methodInfo.params && methodInfo.params.length > 0) {
+                // Crear mapeo de parámetros por nombre
+                const paramMap = {};
+                methodInfo.params.forEach(param => {
+                    paramMap[param.name] = param;
+                });
+
+                const paramNames = methodInfo.params.map(p => p.name);
+                paramNames.forEach((paramName, index) => {
+                    if (index < args.length) {
+                        params[paramName] = args[index];
+                    } else {
+                        // Usar valor por defecto si existe
+                        const paramDef = paramMap[paramName];
+                        if (paramDef && paramDef.default !== null) {
+                            params[paramName] = paramDef.default;
+                        }
+                    }
+                });
+            }
+            // Fallback: pasar todos los args como array
+            else if (args.length > 0) {
+                params = {args: args};
+            }
+
+            // Validar parámetros requeridos
+            const missingParams = this.validateRpcParameters(methodInfo, params);
+            if (missingParams.length > 0) {
+                return Promise.reject(new Error(
+                    `Missing required parameters for ${methodName}: ${missingParams.join(', ')}`
+                ));
+            }
+
+            // Llamar al método RPC
+            return this.rpc(methodName, params);
+        }.bind(this);
+    }
+
+    /**
+     * Crea stubs namespaced (ej: client.db.health.status())
+     */
+    createNamespacedRpcStub(fullName, methodInfo) {
+        const parts = fullName.split('.');
+        let current = this.rpcBaseNamespace;
+        if (typeof current !== 'object') {
+            if (current === null) {
+                current = this;
+            }
+            if (typeof current === 'string') {
+                if (!window[current]) {
+                    window[current] = {};
+                }
+                current = window[current];
+            }
+        }
+
+        // Crear namespaces anidados
+        for (let i = 0; i < parts.length - 1; i++) {
+            const part = parts[i];
+            if (!current[part] || typeof current[part] !== 'object') {
+                current[part] = {};
+            }
+            current = current[part];
+        }
+
+        // Asignar el método al último namespace
+        const methodName = parts[parts.length - 1];
+        current[methodName] = this.createRpcStubFunction(fullName, methodInfo);
+    }
+
+    /**
+     * Valida los parámetros de un método RPC
+     */
+    validateRpcParameters(methodInfo, params) {
+        const missing = [];
+
+        if (Array.isArray(methodInfo.params)) {
+            methodInfo.params.forEach(param => {
+                if (param.required &&
+                    (params[param.name] === undefined || params[param.name] === null)) {
+                    missing.push(param.name);
+                }
+            });
+        }
+
+        return missing;
+    }
+
+    /**
+     * Obtiene información de un método RPC específico
+     */
+    getRpcMethodInfo(methodName) {
+        //console.log(this.rpcMethodsMetadata, methodName);
+        return this.rpcMethodsMetadata.get(methodName);
+    }
+
+    /**
+     * Lista todos los métodos RPC disponibles
+     */
+    listRpcMethods() {
+        return Array.from(this.rpcMethodsMetadata.values());
+    }
+
+    /**
+     * Busca métodos RPC por nombre o descripción
+     */
+    searchRpcMethods(query) {
+        query = query.toLowerCase();
+        return Array.from(this.rpcMethodsMetadata.values()).filter(method => {
+            return method.method.toLowerCase().includes(query) ||
+                method.description.toLowerCase().includes(query);
+        });
     }
 
     /**
@@ -819,6 +1043,13 @@ export default class VecturaPubSub extends EventTarget {
 
         switch (data.status) {
             case this.RPC_STATUS_ACCEPTED:
+                // Marcar como aceptado
+                if (handler.accept) {
+                    handler.accept();
+                }
+                // Actualizar estado del handler
+                handler.accepted = true;
+                handler.acceptedAt = Date.now();
                 this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_RPC_ACCEPTED, {
                     detail: {
                         id: data.id,
@@ -828,11 +1059,21 @@ export default class VecturaPubSub extends EventTarget {
                     }
                 }));
                 this.debug(`RPC ${data.id} (${handler.method}) accepted by worker ${data.worker_id}`);
+                if (!handler.status) {
+                    handler.status = 'accepted';
+                    handler.acceptedAt = Date.now();
+                }
                 break;
 
             case this.RPC_STATUS_COMPLETED:
                 this.debug(`RPC ${data.id} (${handler.method}) completed in ${Date.now() - handler.startTime}ms`);
-                handler.resolve(data.result || data.message);
+                // Verificar que fue aceptado primero
+                if (!handler.accepted) {
+                    this.warn(`RPC ${data.id} completed without being accepted first`);
+                }
+                if (handler.resolve) {
+                    handler.resolve(data.result || data.message || data);
+                }
                 this.rpcHandlers.delete(data.id);
                 this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_RPC_COMPLETED, {
                     detail: {
@@ -870,29 +1111,56 @@ export default class VecturaPubSub extends EventTarget {
         }
     }
 
-    async rpc(method, params = {}, timeout = 30000) {
+    /**
+     * Método RPC existente - mejorado para trabajar con stubs
+     */// Versión corregida de rpc() - SIN async
+    rpc(method, params = {}, timeout = 30000) {
         if (!this.isReady()) {
-            throw new Error('WebSocket not connected. Cannot execute RPC.');
+            return Promise.reject(new Error('WebSocket not connected. Cannot execute RPC.'));
+        }
+
+        const methodInfo = this.getRpcMethodInfo(method);
+        if (methodInfo && !methodInfo.allow_guest && !this.token) {
+            return Promise.reject(new Error(`Method ${method} requires authentication`));
         }
 
         return new Promise((resolve, reject) => {
             const requestId = this.generateRequestId();
             let timeoutId;
+            let accepted = false;
 
             this.dispatchEvent(new CustomEvent(this.EVENT_TYPE_RPC_START_EXEC, {
-                detail: {id: requestId, method: method}
+                detail: {id: requestId, method: method, params: params}
             }));
 
             const cleanup = () => {
-                clearTimeout(timeoutId);
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                    timeoutId = null;
+                }
                 this.rpcHandlers.delete(requestId);
             };
 
             if (timeout > 0) {
+                // Primer timeout: si no es aceptado rápidamente
+                const acceptTimeout = Math.min(5000, timeout); // 5 segundos o menos
                 timeoutId = setTimeout(() => {
-                    cleanup();
-                    reject(new Error(`RPC timeout(${timeout}ms) on method: ${method}`));
-                }, timeout);
+                    if (!accepted) {
+                        this.error(`RPC ${requestId} not accepted within ${acceptTimeout}ms`);
+                        cleanup();
+                        reject(new Error(`RPC not accepted within ${acceptTimeout}ms for method: ${method}`));
+                    } else {
+                        // Si fue aceptado pero no completado, usar timeout completo
+                        this.log(`RPC ${requestId} accepted, waiting for completion (${timeout - acceptTimeout}ms remaining)`);
+
+                        // Configurar nuevo timeout para la finalización
+                        timeoutId = setTimeout(() => {
+                            this.error(`RPC ${requestId} timeout after acceptance: ${method}`);
+                            cleanup();
+                            reject(new Error(`RPC timeout(${timeout}ms) on method: ${method} (was accepted but not completed)`));
+                        }, timeout - acceptTimeout);
+                    }
+                }, acceptTimeout);
             }
 
             this.rpcHandlers.set(requestId, {
@@ -904,37 +1172,49 @@ export default class VecturaPubSub extends EventTarget {
                     cleanup();
                     reject(error);
                 },
-                method: method,
-                startTime: Date.now()
-            });
-
-            this.ws.send(JSON.stringify({
-                action: this.ACTION_RPC_CALL,
-                id: requestId,
+                accept: () => {
+                    console.log(`📥 RPC ${requestId} marked as accepted`);
+                    accepted = true;
+                    // Podemos extender el timeout aquí si queremos
+                },
                 method: method,
                 params: params,
-                timeout: Math.floor(timeout / 1000)
-            }));
+                startTime: Date.now(),
+                accepted: false
+            });
 
-            this.debug(`RPC ${requestId} sent: ${method}`);
+            try {
+                this.ws.send(JSON.stringify({
+                    action: this.ACTION_RPC_CALL,
+                    id: requestId,
+                    method: method,
+                    params: params,
+                    timeout: Math.floor(timeout / 1000)
+                }));
+
+                this.debug(`RPC ${requestId} sent: ${method}`, params);
+            } catch (error) {
+                cleanup();
+                reject(new Error(`Failed to send RPC: ${error.message}`));
+            }
         });
     }
 
-    listRpcMethods() {
-        if (!this.isReady()) {
-            return Promise.reject(new Error('WebSocket disconnected. Cannot list RPC methods.'));
-        }
+    /* listRpcMethods() {
+         if (!this.isReady()) {
+             return Promise.reject(new Error('WebSocket disconnected. Cannot list RPC methods.'));
+         }
 
-        return new Promise((resolve) => {
-            const handler = (event) => {
-                this.removeEventListener(this.EVENT_TYPE_RPC_METHODS, handler);
-                resolve(event.detail);
-            };
+         return new Promise((resolve) => {
+             const handler = (event) => {
+                 this.removeEventListener(this.EVENT_TYPE_RPC_METHODS, handler);
+                 resolve(event.detail);
+             };
 
-            this.addEventListener(this.EVENT_TYPE_RPC_METHODS, handler);
-            this.ws.send(JSON.stringify({action: this.ACTION_LIST_RPC_METHODS}));
-        });
-    }
+             this.addEventListener(this.EVENT_TYPE_RPC_METHODS, handler);
+             this.ws.send(JSON.stringify({action: this.ACTION_LIST_RPC_METHODS}));
+         });
+     }*/
 
     generateRequestId() {
         return Date.now().toString(36) + Math.random().toString(36).substr(2);
@@ -1005,5 +1285,1035 @@ export default class VecturaPubSub extends EventTarget {
      */
     hasSubscription(channel) {
         return this.subscriptions.has(channel);
+    }
+
+    /**
+     * Genera documentación de métodos RPC en formato HTML
+     * Ahora incluye el script para testRpcMethod
+     */
+    generateRpcDocumentation() {
+        const methods = this.listRpcMethods();
+
+        // Asegurar que la función global existe
+        if (!window.testRpcMethod) {
+            this.createGlobalTestRpcMethod();
+        }
+
+        const html = `
+        <div class="rpc-documentation">
+            <div style="margin-bottom: 20px; padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px; color: white;">
+                <h1 style="margin: 0 0 10px 0; font-size: 24px;">📚 RPC Methods Documentation</h1>
+                <div style="display: flex; gap: 20px; font-size: 14px;">
+                    <div>
+                        <strong>Total methods:</strong> ${methods.length}
+                    </div>
+                    <div>
+                        <strong>Server:</strong> ${this.url}
+                    </div>
+                    <div>
+                        <strong>Status:</strong> 
+                        <span style="display: inline-block; padding: 2px 8px; background: ${this.isReady() ? 'rgba(255,255,255,0.2)' : 'rgba(220,53,69,0.8)'}; border-radius: 12px;">
+                            ${this.isReady() ? '✅ Connected' : '❌ Disconnected'}
+                        </span>
+                    </div>
+                </div>
+            </div>
+            
+            <div style="margin-bottom: 20px; display: flex; gap: 10px; align-items: center;">
+                <input 
+                    type="text" 
+                    id="rpc-search" 
+                    placeholder="🔍 Search methods by name or description..." 
+                    style="flex: 1; padding: 12px; border: 1px solid #dee2e6; border-radius: 6px; font-size: 14px;"
+                />
+                <button id="clear-search" style="padding: 12px 16px; background: #6c757d; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                    Clear
+                </button>
+            </div>
+            
+            <div id="methods-count" style="margin-bottom: 10px; color: #666; font-size: 14px;">
+                Showing ${methods.length} methods
+            </div>
+            
+            <div id="rpc-methods-list">
+                ${methods.map((method, index) => {
+            // Determinar icono basado en el método
+            let icon = '🔧';
+            if (method.method.includes('db.')) icon = '🗄️';
+            if (method.method.includes('auth.')) icon = '🔐';
+            if (method.method.includes('server.')) icon = '🖥️';
+            if (method.method.includes('ws.')) icon = '⚡';
+            if (method.method.includes('ping')) icon = '🏓';
+            if (method.method.includes('health')) icon = '❤️';
+
+            return `
+                        <div class="rpc-method" 
+                             id="method-${method.method.replace(/\./g, '-')}" 
+                             data-name="${method.method.toLowerCase()}" 
+                             data-description="${method.description.toLowerCase()}"
+                             data-index="${index}">
+                            
+                            <div class="rpc-method-header">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <span style="font-size: 20px;">${icon}</span>
+                                    <div>
+                                        <h3 style="margin: 0; color: #0366d6; font-weight: 600; font-size: 16px;">
+                                            ${method.method}
+                                        </h3>
+                                        <div class="method-metadata" style="display: flex; gap: 10px; font-size: 12px; color: #666; margin-top: 2px;">
+                                            <span class="method-id">#${index + 1}</span>
+                                            <span>•</span>
+                                            <span>${method.params ? method.params.length : 0} params</span>
+                                            ${method.allow_guest ?
+                '<span style="color: #28a745;">• Guest allowed</span>' :
+                '<span style="color: #dc3545;">• Auth required</span>'
+            }
+                                        </div>
+                                    </div>
+                                </div>
+                                <button onclick="window.testRpcMethod('${method.method}')" class="test-button">
+                                    🧪 Test
+                                </button>
+                            </div>
+                            
+                            <p class="description" style="margin: 12px 0; color: #495057; line-height: 1.5;">
+                                ${method.description}
+                            </p>
+                            
+                            ${method.params && method.params.length > 0 ? `
+                                <div class="parameters-section">
+                                    <h4 style="margin: 0 0 12px 0; color: #495057; font-size: 14px; font-weight: 600;">
+                                        📋 Parameters
+                                    </h4>
+                                    <div class="parameters-grid">
+                                        ${method.params.map(param => {
+                // Determinar si tiene enum
+                const hasEnum = param.enum && Array.isArray(param.enum) && param.enum.length > 0;
+
+                return `
+                                                <div class="parameter-card ${hasEnum ? 'has-enum' : ''}">
+                                                    <div class="parameter-header">
+                                                        <span class="param-name">${param.name}</span>
+                                                        <span class="param-type ${param.required ? 'required' : 'optional'}">
+                                                            ${param.type}
+                                                            ${param.required ? ' (required)' : ' (optional)'}
+                                                        </span>
+                                                    </div>
+                                                    
+                                                    ${param.description ? `
+                                                        <div class="param-description">
+                                                            ${param.description}
+                                                        </div>
+                                                    ` : ''}
+                                                    
+                                                    ${hasEnum ? `
+                                                        <div class="param-enum">
+                                                            <div style="font-size: 12px; color: #6c757d; margin-bottom: 4px;">
+                                                                Allowed values:
+                                                            </div>
+                                                            <div class="enum-values">
+                                                                ${param.enum.map(value => `
+                                                                    <span class="enum-value" title="Click to use this value">
+                                                                        ${value}
+                                                                    </span>
+                                                                `).join('')}
+                                                            </div>
+                                                        </div>
+                                                    ` : ''}
+                                                    
+                                                    <div class="param-details">
+                                                        ${param.default !== null && param.default !== undefined ? `
+                                                            <div class="param-detail">
+                                                                <span class="detail-label">Default:</span>
+                                                                <span class="detail-value">${typeof param.default === 'string' ? param.default : JSON.stringify(param.default)}</span>
+                                                            </div>
+                                                        ` : ''}
+                                                        
+                                                        ${param.example !== null && param.example !== undefined ? `
+                                                            <div class="param-detail">
+                                                                <span class="detail-label">Example:</span>
+                                                                <span class="detail-value">${typeof param.example === 'string' ? param.example : JSON.stringify(param.example)}</span>
+                                                            </div>
+                                                        ` : ''}
+                                                    </div>
+                                                </div>
+                                            `;
+            }).join('')}
+                                    </div>
+                                </div>
+                            ` : `
+                                <div class="no-params">
+                                    <span style="color: #6c757d; font-style: italic;">
+                                        No parameters required
+                                    </span>
+                                </div>
+                            `}
+                        </div>
+                    `;
+        }).join('')}
+            </div>
+            
+            ${methods.length === 0 ? `
+                <div style="text-align: center; padding: 40px; color: #6c757d;">
+                    <div style="font-size: 48px; margin-bottom: 20px;">📭</div>
+                    <p style="margin: 0 0 20px 0; font-size: 16px;">No RPC methods available</p>
+                    <button onclick="location.reload()" style="padding: 10px 20px; background: #0366d6; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                        🔄 Reload Methods
+                    </button>
+                </div>
+            ` : ''}
+        </div>
+        
+        <style>
+            .rpc-documentation {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                color: #212529;
+            }
+            
+            .rpc-method {
+                background: white;
+                border: 1px solid #e9ecef;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 16px;
+                transition: all 0.2s ease;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            }
+            
+            .rpc-method:hover {
+                border-color: #0366d6;
+                box-shadow: 0 2px 8px rgba(3, 102, 214, 0.1);
+            }
+            
+            .rpc-method-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                margin-bottom: 8px;
+            }
+            
+            .test-button {
+                padding: 8px 16px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 500;
+                transition: transform 0.2s, box-shadow 0.2s;
+                white-space: nowrap;
+            }
+            
+            .test-button:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+            }
+            
+            .parameters-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 16px;
+                margin-top: 8px;
+            }
+            
+            .parameter-card {
+                background: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 6px;
+                padding: 16px;
+                transition: all 0.2s ease;
+            }
+            
+            .parameter-card.has-enum {
+                border-left: 4px solid #28a745;
+            }
+            
+            .parameter-card:hover {
+                background: #e9ecef;
+                border-color: #adb5bd;
+            }
+            
+            .parameter-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+            }
+            
+            .param-name {
+                font-weight: 600;
+                color: #212529;
+                font-size: 14px;
+            }
+            
+            .param-type {
+                font-size: 12px;
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-weight: 500;
+            }
+            
+            .param-type.required {
+                background: #fff5f5;
+                color: #dc3545;
+                border: 1px solid #f5c6cb;
+            }
+            
+            .param-type.optional {
+                background: #e6f7ff;
+                color: #0366d6;
+                border: 1px solid #91d5ff;
+            }
+            
+            .param-description {
+                color: #495057;
+                font-size: 13px;
+                line-height: 1.4;
+                margin-bottom: 12px;
+            }
+            
+            .param-enum {
+                background: white;
+                border: 1px solid #d1e7dd;
+                border-radius: 4px;
+                padding: 12px;
+                margin-bottom: 12px;
+            }
+            
+            .enum-values {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+            }
+            
+            .enum-value {
+                background: #d1e7dd;
+                color: #0f5132;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-size: 12px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                border: 1px solid transparent;
+            }
+            
+            .enum-value:hover {
+                background: #badbcc;
+                border-color: #0f5132;
+                transform: translateY(-1px);
+            }
+            
+            .param-details {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                font-size: 12px;
+            }
+            
+            .param-detail {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+            }
+            
+            .detail-label {
+                color: #6c757d;
+                font-weight: 500;
+                min-width: 60px;
+            }
+            
+            .detail-value {
+                color: #495057;
+                font-family: 'Courier New', monospace;
+                background: white;
+                padding: 2px 6px;
+                border-radius: 3px;
+                border: 1px solid #dee2e6;
+                flex: 1;
+                word-break: break-all;
+            }
+            
+            .no-params {
+                padding: 12px;
+                background: #f8f9fa;
+                border-radius: 6px;
+                text-align: center;
+            }
+            
+            /* Search filtering */
+            .rpc-method.hidden {
+                display: none;
+            }
+            
+            /* Responsive */
+            @media (max-width: 768px) {
+                .parameters-grid {
+                    grid-template-columns: 1fr;
+                }
+                
+                .rpc-method-header {
+                    flex-direction: column;
+                    gap: 12px;
+                }
+                
+                .test-button {
+                    align-self: flex-start;
+                }
+            }
+        </style>
+        
+        <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                const searchInput = document.getElementById('rpc-search');
+                const clearButton = document.getElementById('clear-search');
+                const methodsList = document.getElementById('rpc-methods-list');
+                const methodsCount = document.getElementById('methods-count');
+                const methods = Array.from(methodsList.querySelectorAll('.rpc-method'));
+                
+                // Función para filtrar métodos
+                function filterMethods(query) {
+                    const searchTerm = query.toLowerCase().trim();
+                    let visibleCount = 0;
+                    
+                    methods.forEach(method => {
+                        const name = method.dataset.name;
+                        const description = method.dataset.description;
+                        
+                        if (searchTerm === '' || 
+                            name.includes(searchTerm) || 
+                            description.includes(searchTerm) ||
+                            method.textContent.toLowerCase().includes(searchTerm)) {
+                            
+                            method.classList.remove('hidden');
+                            visibleCount++;
+                        } else {
+                            method.classList.add('hidden');
+                        }
+                    });
+                    
+                    // Actualizar contador
+                    methodsCount.textContent = \`Showing \${visibleCount} of \${methods.length} methods\`;
+                    
+                    // Resaltar términos de búsqueda
+                    if (searchTerm) {
+                        highlightSearchTerms(searchTerm);
+                    } else {
+                        removeHighlights();
+                    }
+                }
+                
+                // Resaltar términos de búsqueda
+                function highlightSearchTerms(term) {
+                    const regex = new RegExp(\`(\${term.replace(/[.*+?^${'${'}()|[\]\\]/g, '\\\\$&')})\`, 'gi');
+                    
+                    methods.forEach(method => {
+                        if (!method.classList.contains('hidden')) {
+                            const html = method.innerHTML;
+                            const highlighted = html.replace(regex, '<mark style="background: #fff3cd; padding: 0 2px; border-radius: 2px;">$1</mark>');
+                            method.innerHTML = highlighted;
+                        }
+                    });
+                }
+                
+                // Remover resaltados
+                function removeHighlights() {
+                    methods.forEach(method => {
+                        method.innerHTML = method.innerHTML.replace(/<mark[^>]*>([^<]*)<\/mark>/gi, '$1');
+                    });
+                }
+                
+                // Event listeners
+                searchInput.addEventListener('input', function() {
+                    filterMethods(this.value);
+                });
+                
+                clearButton.addEventListener('click', function() {
+                    searchInput.value = '';
+                    filterMethods('');
+                    searchInput.focus();
+                });
+                
+                // Permitir buscar con Enter
+                searchInput.addEventListener('keyup', function(e) {
+                    if (e.key === 'Enter') {
+                        const visibleMethods = methodsList.querySelectorAll('.rpc-method:not(.hidden)');
+                        if (visibleMethods.length > 0) {
+                            visibleMethods[0].scrollIntoView({ 
+                                behavior: 'smooth', 
+                                block: 'center' 
+                            });
+                        }
+                    }
+                });
+                
+                // Manejar clicks en valores enum
+                document.addEventListener('click', function(e) {
+                    if (e.target.classList.contains('enum-value')) {
+                        const paramCard = e.target.closest('.parameter-card');
+                        const paramName = paramCard.querySelector('.param-name').textContent;
+                        
+                        // Crear mensaje para copiar
+                        const value = e.target.textContent;
+                        const message = \`Click "Test" button and use "\${value}" for \${paramName}\`;
+                        
+                        // Mostrar tooltip
+                        const tooltip = document.createElement('div');
+                        tooltip.style.cssText = \`
+                            position: fixed;
+                            top: \${e.clientY + 10}px;
+                            left: \${e.clientX}px;
+                            background: #28a745;
+                            color: white;
+                            padding: 8px 12px;
+                            border-radius: 4px;
+                            font-size: 12px;
+                            z-index: 10000;
+                            pointer-events: none;
+                            animation: fadeOut 2s forwards;
+                        \`;
+                        
+                        tooltip.textContent = message;
+                        document.body.appendChild(tooltip);
+                        
+                        // Remover después de 2 segundos
+                        setTimeout(() => {
+                            document.body.removeChild(tooltip);
+                        }, 2000);
+                        
+                        // Añadir estilo CSS para la animación
+                        if (!document.getElementById('tooltip-animation')) {
+                            const style = document.createElement('style');
+                            style.id = 'tooltip-animation';
+                            style.textContent = \`
+                                @keyframes fadeOut {
+                                    0% { opacity: 1; transform: translateY(0); }
+                                    70% { opacity: 1; transform: translateY(-5px); }
+                                    100% { opacity: 0; transform: translateY(-10px); }
+                                }
+                            \`;
+                            document.head.appendChild(style);
+                        }
+                    }
+                });
+                
+                // Inicializar
+                filterMethods('');
+            });
+        </script>
+    `;
+
+        return {
+            html: html,
+            methods: methods,
+            count: methods.length,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    /**
+     * Función global para probar métodos RPC desde la documentación generada
+     * Esta función se asigna a window.testRpcMethod para que sea accesible desde los botones
+     */createGlobalTestRpcMethod() {
+        const client = this;
+
+        window.testRpcMethod = function (methodName) {
+            console.group(`🧪 testRpcMethod: ${methodName} (using .then())`);
+
+            const methodInfo = client.getRpcMethodInfo(methodName);
+            if (!methodInfo) {
+                alert(`Method ${methodName} not found`);
+                console.groupEnd();
+                return;
+            }
+
+            // 1. Crear diálogo simple
+            const dialog = document.createElement('dialog');
+            dialog.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 20px;
+            background: white;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            width: 600px;
+            max-width: 90vw;
+            max-height: 90vh;
+            overflow: auto;
+            z-index: 1000;
+        `;
+
+            dialog.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h2 style="margin: 0; color: #0366d6;">Test RPC: ${methodName}</h2>
+                <button id="close-dialog" style="background: none; border: none; font-size: 24px; cursor: pointer; color: #666;">×</button>
+            </div>
+            
+            <p style="margin: 0 0 20px 0; color: #666;">${methodInfo.description}</p>
+            
+            <div id="params-container" style="margin-bottom: 20px;"></div>
+            
+  <!--          <div style="margin-bottom: 20px; padding: 10px; background: #f8f9fa; border-radius: 4px; border: 1px solid #eee;">
+                <h4 style="margin: 0 0 10px 0;">Quick Actions:</h4>
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button id="test-empty" style="padding: 8px 16px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        Test Empty
+                    </button>
+                    <button id="test-defaults" style="padding: 8px 16px; background: #17a2b8; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        Test Defaults
+                    </button>
+                    <button id="test-example" style="padding: 8px 16px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        Test with Example
+                    </button>
+                </div>
+            </div>-->
+            
+            <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+                <button id="execute-test" style="padding: 12px 24px; background: #0366d6; color: white; border: none; border-radius: 4px; cursor: pointer; flex: 1; font-weight: bold;">
+                    Execute RPC
+                </button>
+                <button id="cancel-test" style="padding: 12px 24px; background: #f0f0f0; color: #333; border: 1px solid #ddd; border-radius: 4px; cursor: pointer;">
+                    Cancel
+                </button>
+            </div>
+            
+            <div id="status-container" style="margin: 20px 0;"></div>
+            
+            <div id="test-result" style="margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 4px; border-left: 4px solid #28a745; display: none;">
+                <h3 style="margin: 0 0 10px 0; color: #28a745;">✅ Success</h3>
+                <pre id="result-content" style="margin: 0; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow: auto; background: white; padding: 10px; border-radius: 4px;"></pre>
+            </div>
+            
+            <div id="test-error" style="margin-top: 20px; padding: 15px; background: #fee; border-radius: 4px; border-left: 4px solid #dc3545; display: none;">
+                <h3 style="margin: 0 0 10px 0; color: #dc3545;">❌ Error</h3>
+                <pre id="error-content" style="margin: 0; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow: auto; background: #fff5f5; padding: 10px; border-radius: 4px;"></pre>
+            </div>
+            
+            <div id="debug-console" style="margin-top: 20px; padding: 10px; background: #333; color: #0f0; border-radius: 4px; font-family: monospace; font-size: 12px; max-height: 200px; overflow: auto; display: none;">
+                <h4 style="margin: 0 0 10px 0; color: #0f0;">Debug Console</h4>
+                <div id="debug-output" style="white-space: pre-wrap;"></div>
+            </div>
+        `;
+
+            document.body.appendChild(dialog);
+
+            // Elementos del DOM
+            const paramsContainer = dialog.querySelector('#params-container');
+            const statusContainer = dialog.querySelector('#status-container');
+            const debugConsole = dialog.querySelector('#debug-console');
+            const debugOutput = dialog.querySelector('#debug-output');
+
+            // Helper para log en la consola de debug
+            function debugLog(message, data = null) {
+                const timestamp = new Date().toLocaleTimeString();
+                const entry = `[${timestamp}] ${message}` + (data ? `: ${JSON.stringify(data, null, 2)}` : '');
+
+                console.log(entry);
+
+                // Agregar a consola de debug
+                if (debugOutput) {
+                    debugOutput.innerHTML = entry + '\n' + debugOutput.innerHTML;
+                    debugConsole.style.display = 'block';
+                }
+            }
+
+            // Helper para mostrar estado
+            function showStatus(message, type = 'info') {
+                const colors = {
+                    info: '#0366d6',
+                    success: '#28a745',
+                    warning: '#ffc107',
+                    error: '#dc3545'
+                };
+
+                statusContainer.innerHTML = `
+                <div style="padding: 10px; background: ${colors[type]}15; border: 1px solid ${colors[type]}; border-radius: 4px; color: ${colors[type]};">
+                    ${message}
+                </div>
+            `;
+            }
+
+            // Helper para limpiar resultados
+            function clearResults() {
+                dialog.querySelector('#test-result').style.display = 'none';
+                dialog.querySelector('#test-error').style.display = 'none';
+                statusContainer.innerHTML = '';
+            }
+
+            // Helper para convertir tipos de PHP a JS
+            function phpToJsType(phpType) {
+                const typeMap = {
+                    'int': 'integer',
+                    'integer': 'integer',
+                    'float': 'number',
+                    'double': 'number',
+                    'bool': 'boolean',
+                    'boolean': 'boolean',
+                    'array': 'object', // En PHP arrays asociativos son objetos en JS
+                    'string': 'string',
+                    'mixed': 'any'
+                };
+
+                return typeMap[phpType.toLowerCase()] || 'string';
+            }
+
+            // Helper para crear valor por defecto basado en tipo
+            function getDefaultValueForType(type) {
+                const jsType = phpToJsType(type);
+
+                switch (jsType) {
+                    case 'integer':
+                    case 'number':
+                        return null;
+                    case 'boolean':
+                        return null;
+                    case 'object':
+                        return {};
+                    case 'array':
+                        return [];
+                    case 'string':
+                        return null;
+                    default:
+                        return null;
+                }
+            }
+
+            // Crear inputs para parámetros
+            // Dentro de createGlobalTestRpcMethod, en la sección de creación de inputs:
+            if (methodInfo.params && methodInfo.params.length > 0) {
+                paramsContainer.innerHTML = `
+        <h3 style="margin: 0 0 15px 0;">Parameters</h3>
+        ${methodInfo.params.map((param, index) => {
+                    const hasEnum = param.enum && Array.isArray(param.enum) && param.enum.length > 0;
+
+                    // Determinar valor por defecto
+                    let defaultValue = '';
+                    if (param.default !== null && param.default !== undefined) {
+                        defaultValue = typeof param.default === 'string'
+                            ? param.default
+                            : JSON.stringify(param.default);
+                    }
+
+                    // Si tiene enum, usar el primer valor como default si no hay otro
+                    if (hasEnum && !defaultValue && param.enum.length > 0) {
+                        defaultValue = param.enum[0];
+                    }
+
+                    return `
+                <div style="margin-bottom: 20px;" data-param="${param.name}">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <label style="font-weight: 600; color: #333;">
+                            ${param.name}
+                            ${param.required ? '<span style="color: #dc3545;">*</span>' : ''}
+                        </label>
+                        <span style="font-size: 12px; color: #666;">
+                            ${param.type}
+                        </span>
+                    </div>
+                    
+                    ${param.description ? `
+                        <div style="color: #666; font-size: 14px; margin-bottom: 8px;">
+                            ${param.description}
+                        </div>
+                    ` : ''}
+                    
+                    ${hasEnum ? `
+                        <div style="margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 4px; border: 1px solid #dee2e6;">
+                            <div style="font-size: 12px; color: #666; margin-bottom: 6px;">Select from allowed values:</div>
+                            <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+                                ${param.enum.map(value => `
+                                    <button type="button" 
+                                            class="enum-selector" 
+                                            data-value="${value}"
+                                            style="padding: 6px 12px; background: #e9ecef; border: 1px solid #ced4da; border-radius: 4px; cursor: pointer; font-size: 13px; transition: all 0.2s;">
+                                        ${value}
+                                    </button>
+                                `).join('')}
+                            </div>
+                        </div>
+                    ` : ''}
+                    
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <input 
+                            type="text" 
+                            id="param-${param.name}" 
+                            class="param-input ${hasEnum ? 'has-enum' : ''}"
+                            data-type="${param.type}"
+                            data-required="${param.required}"
+                            style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-family: ${hasEnum ? 'inherit' : 'monospace'};"
+                            placeholder="${hasEnum ? 'Select from options above' : 'Enter value'}"
+                            value="${defaultValue}"
+                            ${hasEnum ? 'readonly' : ''}
+                        />
+                        <button type="button" 
+                                class="clear-param" 
+                                style="padding: 10px 16px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; white-space: nowrap;">
+                            Clear
+                        </button>
+                    </div>
+                    
+                    ${param.default !== null && param.default !== undefined ? `
+                        <div style="margin-top: 6px; font-size: 12px; color: #666;">
+                            Default: <code style="background: #f8f9fa; padding: 2px 4px; border-radius: 2px;">${typeof param.default === 'string' ? param.default : JSON.stringify(param.default)}</code>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+                }).join('')}
+    `;
+
+                // Manejar selectores de enum
+                dialog.querySelectorAll('.enum-selector').forEach(button => {
+                    button.addEventListener('click', function() {
+                        const value = this.dataset.value;
+                        const paramDiv = this.closest('[data-param]');
+                        const paramName = paramDiv.dataset.param;
+                        const input = dialog.querySelector(`#param-${paramName}`);
+
+                        // Actualizar input
+                        if (input) {
+                            input.value = value;
+
+                            // Resaltar botón seleccionado
+                            paramDiv.querySelectorAll('.enum-selector').forEach(btn => {
+                                btn.style.background = '#e9ecef';
+                                btn.style.borderColor = '#ced4da';
+                                btn.style.color = '#212529';
+                            });
+
+                            this.style.background = '#28a745';
+                            this.style.borderColor = '#28a745';
+                            this.style.color = 'white';
+                        }
+                    });
+
+                    // Resaltar botón que coincide con el valor actual
+                    const paramDiv = button.closest('[data-param]');
+                    const paramName = paramDiv.dataset.param;
+                    const input = dialog.querySelector(`#param-${paramName}`);
+
+                    if (input && input.value === button.dataset.value) {
+                        button.style.background = '#28a745';
+                        button.style.borderColor = '#28a745';
+                        button.style.color = 'white';
+                    }
+                });
+            }else {
+                paramsContainer.innerHTML = '<p style="color: #666; font-style: italic; padding: 20px; text-align: center;">No parameters required for this method.</p>';
+            }
+
+            // Helper para recolectar parámetros del formulario
+            function collectParams() {
+                const params = {};
+
+                if (methodInfo.params) {
+                    methodInfo.params.forEach(param => {
+                        const input = dialog.querySelector(`#param-${param.name}`);
+                        let value = input ? input.value.trim() : null;
+                        if(value === 'null') value = null;
+                        // Si está vacío y no es requerido, usar null
+                        if (!value && !param.required) {
+                            //  params[param.name] = null;
+                            return;
+                        }
+
+                        // Convertir según tipo de PHP
+                        try {
+                            switch (param.type.toLowerCase()) {
+                                case 'int':
+                                case 'integer':
+                                    params[param.name] = value ? parseInt(value, 10) : null;
+                                    break;
+
+                                case 'float':
+                                case 'double':
+                                    params[param.name] = value ? parseFloat(value) : null;
+                                    break;
+
+                                case 'bool':
+                                case 'boolean':
+                                    if (typeof value === 'string') {
+                                        params[param.name] = value.toLowerCase() === 'true' || value === '1';
+                                    } else {
+                                        params[param.name] = Boolean(value);
+                                    }
+                                    break;
+
+                                case 'array':
+                                    // Para PHP, arrays asociativos pueden ser objetos en JS
+                                    if (value) {
+                                        try {
+                                            const parsed = JSON.parse(value);
+                                            params[param.name] = Array.isArray(parsed) ? parsed :
+                                                (typeof parsed === 'object' ? parsed : [parsed]);
+                                        } catch {
+                                            // Si no es JSON válido, crear array con el valor
+                                            params[param.name] = [value];
+                                        }
+                                    } else {
+                                        params[param.name] = [];
+                                    }
+                                    break;
+
+                                case 'object':
+                                    if (value) {
+                                        try {
+                                            params[param.name] = JSON.parse(value);
+                                        } catch {
+                                            params[param.name] = {value: value};
+                                        }
+                                    } else {
+                                        params[param.name] = {};
+                                    }
+                                    break;
+
+                                default:
+                                    // String y otros tipos
+                                    params[param.name] = value;
+                            }
+                        } catch (error) {
+                            debugLog(`Error parsing param ${param.name}`, error);
+                            params[param.name] = value; // Fallback al valor original
+                        }
+                    });
+                }
+
+                return params;
+            }
+
+            // Función para ejecutar RPC con .then()
+            function executeRpcWithThen(params) {
+                debugLog('Starting RPC execution', {method: methodName, params: params});
+                clearResults();
+                showStatus('Sending RPC request...', 'info');
+
+                // Deshabilitar botón de ejecución
+                const executeButton = dialog.querySelector('#execute-test');
+                const originalText = executeButton.textContent;
+                executeButton.textContent = 'Processing...';
+                executeButton.disabled = true;
+
+                // Usar .then() en lugar de await
+                const rpcPromise = client.rpc(methodName, params, 60000);
+
+                rpcPromise
+                    .then(result => {
+                        debugLog('RPC successful', result);
+                        showStatus('RPC completed successfully!', 'success');
+
+                        // Mostrar resultado
+                        const resultContent = dialog.querySelector('#result-content');
+                        resultContent.textContent = JSON.stringify(result, null, 2);
+                        dialog.querySelector('#test-result').style.display = 'block';
+
+                        // Habilitar botón
+                        executeButton.textContent = originalText;
+                        executeButton.disabled = false;
+                    })
+                    .catch(error => {
+                        debugLog('RPC failed', error);
+                        showStatus(`RPC failed: ${error.message}`, 'error');
+
+                        // Mostrar error
+                        const errorContent = dialog.querySelector('#error-content');
+                        errorContent.textContent = error.message + '\n\nStack trace:\n' + (error.stack || 'No stack trace');
+                        dialog.querySelector('#test-error').style.display = 'block';
+
+                        // Habilitar botón
+                        executeButton.textContent = originalText;
+                        executeButton.disabled = false;
+                    });
+
+                return rpcPromise;
+            }
+
+            // Botones de acción rápida
+            /*    dialog.querySelector('#test-empty').addEventListener('click', () => {
+                    debugLog('Testing with empty params');
+                    executeRpcWithThen({});
+                });
+
+                dialog.querySelector('#test-defaults').addEventListener('click', () => {
+                    const defaultParams = {};
+
+                    if (methodInfo.params) {
+                        methodInfo.params.forEach(param => {
+                            defaultParams[param.name] = getDefaultValueForType(param.type);
+                        });
+                    }
+
+                    debugLog('Testing with default values', defaultParams);
+                    executeRpcWithThen(defaultParams);
+                });
+
+                dialog.querySelector('#test-example').addEventListener('click', () => {
+                    const exampleParams = {};
+
+                    if (methodInfo.params) {
+                        methodInfo.params.forEach(param => {
+                            if (param.example !== null && param.example !== undefined) {
+                                exampleParams[param.name] = param.example;
+                            } else {
+                                exampleParams[param.name] = getDefaultValueForType(param.type);
+                            }
+                        });
+                    }
+
+                    debugLog('Testing with example values', exampleParams);
+                    executeRpcWithThen(exampleParams);
+
+                    // También actualizar los inputs con los ejemplos
+                    if (methodInfo.params) {
+                        methodInfo.params.forEach(param => {
+                            const input = dialog.querySelector(`#param-${param.name}`);
+                            if (input && param.example !== null && param.example !== undefined) {
+                                input.value = typeof param.example === 'string'
+                                    ? param.example
+                                    : JSON.stringify(param.example);
+                            }
+                        });
+                    }
+                });
+    */
+            // Botón de ejecución principal
+            dialog.querySelector('#execute-test').addEventListener('click', () => {
+                const params = collectParams();
+                debugLog('Executing with form params', params);
+                executeRpcWithThen(params);
+            });
+
+            // Manejar cierre
+            dialog.querySelector('#close-dialog').addEventListener('click', () => {
+                document.body.removeChild(dialog);
+            });
+
+            dialog.querySelector('#cancel-test').addEventListener('click', () => {
+                document.body.removeChild(dialog);
+            });
+
+            // Cerrar con Escape
+            dialog.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    document.body.removeChild(dialog);
+                }
+            });
+
+            // Mostrar diálogo
+            dialog.show();
+
+            // Enfocar primer input
+            const firstInput = dialog.querySelector('input');
+            if (firstInput) {
+                firstInput.focus();
+            }
+
+            console.groupEnd();
+        };
+
+        console.log('✅ testRpcMethod creado (usando .then())');
     }
 }

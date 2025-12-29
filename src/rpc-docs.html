@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="es-AR">
+<head>
+    <title>RPC API Documentation</title>
+    <style>
+        .method {
+            border: 1px solid #ddd;
+            margin: 10px;
+            padding: 15px;
+            border-radius: 5px;
+            background: #f9f9f9;
+        }
+        .method h3 {
+            margin: 0 0 10px 0;
+            color: #0366d6;
+        }
+        .method button {
+            margin-top: 10px;
+            padding: 5px 15px;
+            background: #0366d6;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .method button:hover {
+            background: #0250a3;
+        }
+    </style>
+</head>
+<body>
+<div id="test-container"></div>
+<div id="docs-container"></div>
+<script type="module">
+    console.log('Script cargado');
+    import VecturaPubSub from '//{{host}}:{{port}}/js/VecturaPubSub.js';
+
+    window.pubsub = new VecturaPubSub(
+        'ws://{{host}}:{{port}}',
+        {
+            maxFileSize: 100 * 1024 * 1024,
+            maxReconnectAttempts: 15,
+            rpcMethodsUrl: '//{{host}}:{{port}}/api/rpc-methods',
+            loadRpcMethodsOnConnect: true,
+            autoGenerateRpcStubs: true,
+            rpcBaseNamespace: 'Fluxus',
+            verbose: true
+        }
+    );
+    const channels = [
+        'global.notifications',
+        'global.updates'
+    ];
+    window.pubsub.connect();
+
+    // Evento cuando se cargan los métodos RPC
+    window.pubsub.on(window.pubsub.EVENT_TYPE_READY, (data) => {
+        console.log(`✅ READY ✅ `, data);
+        const docs = window.pubsub.generateRpcDocumentation();
+        document.getElementById('docs-container').innerHTML = docs.html;
+    });
+
+
+
+    // También puedes cargar métodos manualmente si no se cargan automáticamente
+ /*   window.pubsub.loadRpcMethodsFromUrl()
+        .then(methods => {
+            console.log('Methods loaded:', methods);
+        })
+        .catch(error => {
+            console.error('Failed to load methods:', error);
+        });*/
+
+
+</script>
+
+</body>
+</html>

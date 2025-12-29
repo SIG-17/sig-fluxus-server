@@ -2,6 +2,8 @@
 <?php
 declare(strict_types=1);
 
+use SIG\Server\Collection\MethodsCollection;
+use SIG\Server\Config\MethodConfig;
 use SIG\Server\Protocol\Status;
 use Bramus\Monolog\Formatter\ColoredLineFormatter;
 use Monolog\Formatter\MongoDBFormatter;
@@ -215,106 +217,83 @@ try {
         }
     }
 
-    // Handler RPC para shutdown
-    $server->registerRpcMethod(
-            method: 'ws.shutdown',
-            handler: function (Fluxus $server, $data, $fd, $requestId) use ($logger) {
-                $logger->notice("Shutdown solicitado via RPC desde FD $fd". var_export($data, true));
-                if (!$server->isRunning()) {
-                    return [
-                            'status' => 'already_in_progress',
-                            'message' => 'Shutdown ya en progreso'
-                    ];
-                }
-                // Enviar respuesta inmediata al cliente
-                $response = $server->responseProtocol->getProtocolFor([
-                        'type' => $server->responseProtocol->get('rpcSuccess'),
-                        'id' => $requestId ?? '',
-                        'status' => Status::success,
-                        'message' => 'Shutdown iniciado, el servidor comenzará a cerrarse en 5 segundos',
-                        '_metadata' => [
-                                'timestamp' => time()
-                        ]
-                ]);
-                $server->sendToClient($fd, $response);
+    $instanceMethods = MethodsCollection::fromArray(
+            [
+                    [
+                            'method' => 'ws.shutdown',
+                            'handler' => function (Fluxus $server, $fd, $requestId) use ($logger) {
+                                $logger->notice("Shutdown solicitado via RPC desde FD $fd");
+                                if (!$server->isRunning()) {
+                                    return [
+                                            'status' => 'already_in_progress',
+                                            'message' => 'Shutdown ya en progreso'
+                                    ];
+                                }
+                                // Enviar respuesta inmediata al cliente
+                                $response = $server->responseProtocol->getProtocolFor([
+                                        'type' => $server->responseProtocol->get('rpcSuccess'),
+                                        'id' => $requestId ?? '',
+                                        'status' => Status::success,
+                                        'message' => 'Shutdown iniciado, el servidor comenzará a cerrarse en 5 segundos',
+                                        '_metadata' => [
+                                                'timestamp' => time()
+                                        ]
+                                ]);
+                                $server->sendToClient($fd, $response);
 
-                // Pequeña pausa para que el mensaje llegue
-                $server->safeSleep(5);
+                                // Pequeña pausa para que el mensaje llegue
+                                $server->safeSleep(5);
 
-                // Iniciar shutdown
-                $server->shutdown();
+                                // Iniciar shutdown
+                                $server->shutdown();
 
-                return null; // Ya enviamos la respuesta
-            },
-            description: 'Shutdown RPC method. Usage: ws.shutdown',
-            coroutine: false);
-    // Handler RPC para shutdown
-    $server->registerRpcMethod(
-            method: 'ws.reload',
-            handler: function (Fluxus $server, $data, $fd, $requestId) use ($logger) {
-                $server->logger->info("Forcing reload from client {$fd}");
-                // Enviar respuesta
-                $response = $server->responseProtocol->getProtocolFor(
-                        [
-                                'type' => $server->responseProtocol->get('rpcSuccess'),
-                            'id' => $requestId ?? '',
-                                'status' => Status::success,
-                                'message' => 'Reload iniciado, el servidor iniciará el proceso en 5 segundos',
-                                '_metadata' => [
-                                        'timestamp' => time()
-                                ]
-                        ]
-                );
-                $server->sendToClient($fd, $response);
-                // Pequeña pausa
-                //Coroutine::sleep(0.05);
-                $server->safeSleep(5);
-                // Ejecutar reload
-                $server->reload();
-                return null; // Ya enviamos la respuesta
-            },
-            description: 'Reload RPC method. Usage: ws.reload',
-            coroutine: false);
+                                return null; // Ya enviamos la respuesta
+                            },
+                            'description' => 'Shutdown RPC method. Usage: ws.shutdown',
+                            'coroutine' => false,
+                            'parameters' => [
+                                    ['name' => 'server', 'type' => 'Fluxus', 'required' => true, 'description' => 'Server instance', 'injected' => true],
+                                    ['name' => 'fd', 'type' => 'int', 'required' => true, 'description' => 'Client FD', 'injected' => true],
+                                    ['name' => 'requestId', 'type' => 'string', 'required' => false, 'description' => 'Request ID', 'injected' => true]
+                            ]
+                    ],
+                    [
 
-    $server->registerRpcMethod(method: 'math.calculate', handler: function ($server, $params, $fd) {
-        $operation = $params['operation'] ?? 'add';
-        $numbers = $params['numbers'] ?? [];
+                            'method' => 'ws.reload',
+                            'handler' => function (Fluxus $server, $fd, $requestId) {
+                                $server->logger->info("Forcing reload from client {$fd}");
+                                // Enviar respuesta
+                                $response = $server->responseProtocol->getProtocolFor(
+                                        [
+                                                'type' => $server->responseProtocol->get('rpcSuccess'),
+                                                'id' => $requestId ?? '',
+                                                'status' => Status::success,
+                                                'message' => 'Reload iniciado, el servidor iniciará el proceso en 5 segundos',
+                                                '_metadata' => [
+                                                        'timestamp' => time()
+                                                ]
+                                        ]
+                                );
+                                $server->sendToClient($fd, $response);
+                                // Pequeña pausa
+                                //Coroutine::sleep(0.05);
+                                $server->safeSleep(5);
+                                // Ejecutar reload
+                                $server->reload();
+                                return null; // Ya enviamos la respuesta
+                            },
+                            'description' => 'Reload RPC method. Usage: ws.reload',
+                            'coroutine' => false,
+                            'parameters' => [
+                                    ['name' => 'server', 'type' => 'Fluxus', 'required' => true, 'description' => 'Server instance', 'injected' => true],
+                                    ['name' => 'fd', 'type' => 'int', 'required' => true, 'description' => 'Client FD', 'injected' => true],
+                                    ['name' => 'requestId', 'type' => 'string', 'required' => false, 'description' => 'Request ID', 'injected' => true]
+                            ]
+                    ]
+            ]
+    );
 
-        if (empty($numbers)) {
-            throw new \InvalidArgumentException('Se requieren números para calcular');
-        }
-
-        if (($params['simulate_delay'] ?? false) === true) {
-            //Coroutine::sleep(0.1);
-            $server->safeSleep(0.1);
-        }
-        $result = match ($operation) {
-            'add' => array_sum($numbers),
-            'multiply' => array_product($numbers),
-            'average' => array_sum($numbers) / count($numbers),
-            'min' => min($numbers),
-            'max' => max($numbers),
-            default => throw new \InvalidArgumentException("Operación no soportada: $operation"),
-        };
-
-        return [
-                'operation' => $operation,
-                'numbers' => $numbers,
-                'result' => $result,
-                'calculated_at' => time(),
-                'worker_id' => $this->getWorkerId()
-        ];
-    }, description: 'Math RPC method. Usage: math.calculate?operation=add&numbers=1,2,3. Available operations: add, multiply, average, min, max.');
-    $server->registerRpcMethod('random.uuid', function ($server, $params, $fd) use ($instance) {
-        return [
-                'message' => uniqid($instance, true),
-                'timestamp' => time(),
-                'client_fd' => $fd,
-                'server_time' => date('Y-m-d H:i:s'),
-                'worker_id' => $server->getWorkerId(),
-                'pid' => posix_getpid()
-        ];
-    });
+    $server->registerRpcMethods($instanceMethods);
     /*    if ($server->setting['task_worker_num'] > 0) {
             $server->registerRpcMethod(
                     method: 'db.failures.retry.task',
@@ -506,5 +485,6 @@ try {
 
 } catch (Throwable $e) {
     $logger->error("❌ Error iniciando servidor: " . $e->getMessage());
+    $logger->debug("❌ Trace: " . $e->getTraceAsString());
     exit(1);
 }

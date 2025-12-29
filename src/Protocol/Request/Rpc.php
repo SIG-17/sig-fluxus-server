@@ -105,12 +105,12 @@ class Rpc extends Base implements RequestHandlerInterface
 
             $server->logger?->debug("🚀 Ejecutando RPC: $method en worker #{$workerId} con ID: $requestId y timeout de: $timeout");
 
-            $server->executeRpcMethod($fd, $requestId, $method, $params, $timeout, $workerId, $coroutine);
+            $server->executeRpcMethod($fd, $requestId, $method, $params, $timeout, $workerId);
 
 
         } catch (\Exception $e) {
             $server->logger?->error("❌ Error procesando RPC: " . $e->getMessage());
-            $server->sendRpcError($fd, $requestId, 'Error interno del servidor');
+            $server->sendRpcError($fd, $requestId, '❌ Error interno del servidor: ' . $e->getMessage());
         }
     }
 }

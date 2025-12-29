@@ -6,7 +6,9 @@ use Psr\Log\LoggerInterface;
 use Redis;
 use SIG\Server\Auth\AuthInterface;
 use SIG\Server\Collection\MethodsCollection;
+use SIG\Server\Config\MethodConfig;
 use SIG\Server\Exception\AuthenticationException;
+use SIG\Server\Exception\InvalidArgumentException;
 use SIG\Server\Exception\UnexpectedValueException;
 use SIG\Server\Protocol\Request\Action;
 use SIG\Server\Protocol\Request\RequestHandlerInterface;
@@ -108,6 +110,7 @@ class Fluxus extends Server
     public Table $rpcRequests;
     private int $rpcRequestCounter = 0;
     public array $rpcHandlers = [];
+    private array $rpcMetadata = [];
     private array $rpcInternalProcessors = [];
 
     private string $serverId;
@@ -298,7 +301,10 @@ class Fluxus extends Server
         $this->rpcMethods->column('coroutine', Table::TYPE_INT, 1);
         $this->rpcMethods->create();
         while ($config = array_shift($this->rpcMethodsQueue)) {
-            $this->registerRpcMethod(...$config);
+            if (is_array($config)) {
+                $this->logger?->debug("Intentando registrar " . var_export($config, true));
+            }
+            $this->registerRpcMethod($config);
         }
 
         $this->rpcRequests = new Table(1024);
@@ -512,7 +518,6 @@ class Fluxus extends Server
         }
     }
 
-
     /**
      * Obtiene estadísticas del servidor
      */
@@ -615,6 +620,58 @@ class Fluxus extends Server
         }
         return $serverId;
     }
+
+    /**
+     * Maneja mensajes entre workers vía sendMessage
+     */
+    public function handlePipeMessage(Server $server, int $srcWorkerId, string $message): void
+    {
+        $currentWorkerId = $this->getWorkerId();
+        $this->logger?->debug("📨 PipeMessage recibido en worker #{$currentWorkerId} desde worker #{$srcWorkerId}");
+
+        try {
+            $data = json_decode($message, true);
+            if (!$data || !isset($data['action'])) {
+                return;
+            }
+
+            if ($data['action'] === 'rpc' && isset($data['method'])) {
+                $this->handleBroadcastRpc($data, $srcWorkerId);
+            }
+
+            if ($data['action'] === 'broadcast_collect') {
+                $this->handleBroadcastCollect($data, $srcWorkerId);
+            }
+            if ($data['action'] === 'collect_response') {
+                $this->handleCollectResponse($server, $data, $srcWorkerId);
+            }
+
+        } catch (\Exception $e) {
+            $this->logger?->error("❌ Error en pipeMessage: " . $e->getMessage());
+        }
+    }
+
+    public function handleTask(Server $server, Task $task): void
+    {
+        $data = $task->data;
+
+        if (isset($data['type'], $data['method'], $this->rpcHandlers[$data['method']]) && $data['type'] === 'broadcast_task') {
+            // Este task worker debe notificar a todos los workers normales
+            // usando sendMessage
+            $message = json_encode([
+                'action' => 'rpc',
+                'method' => $data['method'],
+                'params' => $data['params'] ?? [],
+                'timestamp' => time()
+            ], JSON_THROW_ON_ERROR);
+
+            $totalWorkers = $server->setting['worker_num'] ?? 1;
+            for ($i = 0; $i < $totalWorkers; $i++) {
+                $server->sendMessage($message, $i);
+            }
+        }
+        $task->finish("Task completed");
+    }
     // END SERVER RELATED METHODS
 
     // REDIS RELATED METHODS
@@ -707,7 +764,7 @@ class Fluxus extends Server
             $this->cancelableCids[] = $subscriber;
         }
 
-        return $processor && $subscriber;;
+        return $processor && $subscriber;
     }
 
     /**
@@ -789,30 +846,7 @@ class Fluxus extends Server
     }
     // END REDIS RELATED METHODS
 
-    // WS/PUBSUB RELATED METHODS
-    private function handleRedisMessage(string $channel, string $message): void
-    {
-        try {
-            $data = json_decode($message, true);
-            if (!$data) {
-                $this->logger?->warning('Mensaje Redis no válido: ' . $message);
-                return;
-            }
-
-            $channelName = $data['channel'] ?? str_replace($this->redisChannelPrefix . '.', '', $channel);
-            $metadata = $data['_metadata'] ?? [];
-            // Solo transmitir si el mensaje no viene de este servidor
-            if (!isset($metadata['origin_server']) || $metadata['origin_server'] !== $this->getServerId()) {
-                $this->broadcastToChannel($channelName, $data);
-                $this->logger?->debug("Mensaje Redis transmitido a canal: $channelName");
-            } else {
-                $this->logger?->debug("Mensaje Redis no transmitido a canal: $channelName (mismo servidor?) [$message]");
-            }
-
-        } catch (\Exception $e) {
-            $this->logger?->error('Error procesando mensaje Redis: ' . $e->getMessage());
-        }
-    }
+    // HTTP RELATED METHODS
 
     /**
      * Maneja requests HTTP (para health checks, etc.)
@@ -847,9 +881,358 @@ class Fluxus extends Server
                 ], JSON_THROW_ON_ERROR));
                 break;
 
+            case '/api/rpc':
+                $response->header('Content-Type', 'application/javascript');
+                $response->header('Access-Control-Allow-Origin', '*');
+
+                $methods = $this->exposeRpcMethods();
+                $js = $this->generateJavascriptStubs($methods);
+                $response->end($js);
+                break;
+            case '/api/rpc-docs':
+                $response->header('Content-Type', 'text/html; charset=utf-8');
+                $response->header('Access-Control-Allow-Origin', '*');
+
+                $html = file_get_contents(__DIR__ . '/rpc-docs.html');
+
+                $response->end(str_replace(['{{host}}', '{{port}}'], [$this->host, $this->port], $html));
+               /* $methods = $this->exposeRpcMethods();
+                $js = $this->generateRPCDocumentation($methods);
+                $response->end($js);*/
+                break;
+            case '/api/rpc-methods':
+                $response->header('Content-Type', 'application/json');
+                $response->header('Access-Control-Allow-Origin', '*');
+                $response->end($this->generateJsonMethodsDescription());
+                break;
+            case '/js/VecturaPubSub.js':
+                $response->header('Content-Type', 'application/javascript');
+                $response->header('Access-Control-Allow-Origin', '*');
+                $response->end(file_get_contents(__DIR__ . '/../js/VecturaPubSub.js'));
+                break;
             default:
                 $response->status(404);
                 $response->end('Not Found');
+        }
+    }
+
+    // En tu Fluxus class, añade este método:
+    public function exposeRpcMethods(): array
+    {
+        $methods = [];
+        foreach ($this->getRpcMethodsInfo() as $methodInfo) {
+            if ($methodInfo['only_internal'] ?? 0) {
+                continue;
+            }
+            $methods[$methodInfo['name']] = $methodInfo;
+        }
+
+        return $methods;
+    }
+
+    private function generateJsonMethodsDescription(): string
+    {
+        $json = [
+            'server' => $this->getServerId(),
+            'date' => date('Y-m-d H:i:s'),
+            'type' => 'rpc',
+            'methods' => [],
+        ];
+        $methods = $this->exposeRpcMethods();
+        foreach ($methods as $name => $method) {
+            $params = array_values(array_filter($method['parameters'] ?? [], static fn($param) => (bool)$param['injected'] !== true && $param['type'] !== 'closure'));
+            $json['methods'][] = [
+                'method' => $name,
+                'description' => $method['description'] ?? '',
+                'params' => $params,
+                'allow_guest' => !($method['requires_auth'] ?? true)
+            ];
+        }
+
+        return json_encode($json);
+    }
+
+    private function generateJavascriptStubs(array $methods): string
+    {
+        $js = <<<JS
+// Auto-generated RPC client for Fluxus WebSocket server
+// Generated at: {date}
+// Server: {serverId}
+class VecturaRPC {
+    constructor(wsUrl, options = {}) {
+        this.wsUrl = wsUrl;
+        this.options = {
+            autoReconnect: true,
+            reconnectDelay: 3000,
+            maxReconnectAttempts: 5,
+            requestTimeout: 30000,
+            ...options
+        };
+        
+        this.ws = null;
+        this.connected = false;
+        this.pendingRequests = new Map();
+        this.reconnectAttempts = 0;
+        this.messageQueue = [];
+        this.requestId = 1;
+        
+        this.eventHandlers = {
+            open: [],
+            close: [],
+            error: [],
+            message: []
+        };
+        
+        this.init();
+    }
+    
+    init() {
+        this.connect();
+    }
+    
+    connect() {
+        try {
+            this.ws = new WebSocket(this.wsUrl);
+            this.setupWebSocket();
+        } catch (error) {
+            this.emit('error', error);
+            this.scheduleReconnect();
+        }
+    }
+    
+    setupWebSocket() {
+        this.ws.onopen = (event) => {
+            this.connected = true;
+            this.reconnectAttempts = 0;
+            this.emit('open', event);
+            
+            // Procesar cola de mensajes pendientes
+            this.processMessageQueue();
+        };
+        
+        this.ws.onclose = (event) => {
+            this.connected = false;
+            this.emit('close', event);
+            
+            if (this.options.autoReconnect && 
+                this.reconnectAttempts < this.options.maxReconnectAttempts) {
+                this.scheduleReconnect();
+            }
+        };
+        
+        this.ws.onerror = (error) => {
+            this.emit('error', error);
+        };
+        
+        this.ws.onmessage = (event) => {
+            this.handleMessage(event.data);
+        };
+    }
+    
+    scheduleReconnect() {
+        if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+            return;
+        }
+        
+        this.reconnectAttempts++;
+        const delay = this.options.reconnectDelay * this.reconnectAttempts;
+        
+        setTimeout(() => {
+            if (!this.connected) {
+                this.connect();
+            }
+        }, delay);
+    }
+    
+    handleMessage(data) {
+        try {
+            const message = JSON.parse(data);
+            
+            // Manejar respuestas RPC
+            if (message.type === 'rpc_response' && message.id) {
+                const request = this.pendingRequests.get(message.id);
+                if (request) {
+                    if(message.status === 'accepted') return;
+                    if (message.status === 'success') {
+                        request.resolve(message.result);
+                    } else {
+                        request.reject(new Error(message.error?.message || 'RPC Error'));
+                    }
+                    
+                    clearTimeout(request.timeoutId);
+                    this.pendingRequests.delete(message.id);
+                }
+                return;
+            }
+            
+            // Manejar errores RPC
+            if (message.type === 'rpc_error' && message.id) {
+                const request = this.pendingRequests.get(message.id);
+                if (request) {
+                    request.reject(new Error(message.error?.message || 'RPC Error'));
+                    clearTimeout(request.timeoutId);
+                    this.pendingRequests.delete(message.id);
+                }
+                return;
+            }
+            
+            // Emitir otros mensajes
+            this.emit('message', message);
+            
+        } catch (error) {
+            console.error('Error parsing message:', error, data);
+        }
+    }
+    
+    sendRpc(method, params = {}) {
+        return new Promise((resolve, reject) => {
+            if (!this.connected) {
+                // Encolar si no estamos conectados
+                this.messageQueue.push({ method, params, resolve, reject });
+                reject(new Error('WebSocket not connected'));
+                return;
+            }
+            
+            const requestId = `rpc_\${Date.now()}_\${this.requestId++}`;
+            const message = {
+                action: 'rpc',
+                id: requestId,
+                method: method,
+                params: params,
+                timestamp: Date.now()
+            };
+            
+            // Configurar timeout
+            const timeoutId = setTimeout(() => {
+                if (this.pendingRequests.has(requestId)) {
+                    this.pendingRequests.delete(requestId);
+                    reject(new Error(`RPC timeout for method: \${method}`));
+                }
+            }, this.options.requestTimeout);
+            
+            // Guardar referencia a la promesa
+            this.pendingRequests.set(requestId, { 
+                resolve, 
+                reject, 
+                timeoutId,
+                method,
+                timestamp: Date.now()
+            });
+            
+            // Enviar mensaje
+            this.ws.send(JSON.stringify(message));
+        });
+    }
+    
+    processMessageQueue() {
+        while (this.messageQueue.length > 0) {
+            const { method, params, resolve, reject } = this.messageQueue.shift();
+            this.sendRpc(method, params).then(resolve).catch(reject);
+        }
+    }
+    
+    // Event handling
+    on(event, handler) {
+        if (!this.eventHandlers[event]) {
+            this.eventHandlers[event] = [];
+        }
+        this.eventHandlers[event].push(handler);
+    }
+    
+    off(event, handler) {
+        if (this.eventHandlers[event]) {
+            this.eventHandlers[event] = this.eventHandlers[event].filter(h => h !== handler);
+        }
+    }
+    
+    emit(event, data) {
+        if (this.eventHandlers[event]) {
+            this.eventHandlers[event].forEach(handler => {
+                try {
+                    handler(data);
+                } catch (error) {
+                    console.error(`Error in \${event} handler:`, error);
+                }
+            });
+        }
+    }
+    
+    disconnect() {
+        if (this.ws) {
+            this.ws.close();
+        }
+        this.connected = false;
+    }
+}
+// Métodos RPC disponibles
+const RPC_METHODS = {methods};
+console.log(RPC_METHODS)
+// Crear stubs para cada método
+Object.keys(RPC_METHODS).forEach(methodName => {
+    console.log('Agregando handler para ', methodName);
+    VecturaRPC.prototype[methodName] = function(...args) {
+        // Manejar diferentes estilos de llamada
+        let params = {};
+        
+        if (args.length === 1 && typeof args[0] === 'object') {
+            // Estilo objeto: client.method({ param1: value1 })
+            params = args[0];
+        } else {
+            // Estilo posicional: client.method(value1, value2)
+            // Necesitarías documentar el orden de parámetros
+            const methodInfo = RPC_METHODS[methodName];
+            if (methodInfo.paramNames && methodInfo.paramNames.length === args.length) {
+                methodInfo.paramNames.forEach((paramName, index) => {
+                    params[paramName] = args[index];
+                });
+            } else {
+                // Fallback: args como array
+                params = { args: args };
+            }
+        }
+        
+        return this.sendRpc(methodName, params);
+    };
+});
+// Exportar
+window.VecturaRPC = VecturaRPC;
+JS;
+        // Reemplazar placeholders
+        return str_replace(
+            ['{date}', '{serverId}', '{methods}'],
+            [
+                date('Y-m-d H:i:s'),
+                $this->getServerId(),
+                json_encode($methods, JSON_THROW_ON_ERROR)
+            ],
+            $js
+        );
+    }
+
+    // END HTTP RELATED METHODS
+
+    // WS/PUBSUB RELATED METHODS
+    private function handleRedisMessage(string $channel, string $message): void
+    {
+        try {
+            $data = json_decode($message, true);
+            if (!$data) {
+                $this->logger?->warning('Mensaje Redis no válido: ' . $message);
+                return;
+            }
+
+            $channelName = $data['channel'] ?? str_replace($this->redisChannelPrefix . '.', '', $channel);
+            $metadata = $data['_metadata'] ?? [];
+            // Solo transmitir si el mensaje no viene de este servidor
+            if (!isset($metadata['origin_server']) || $metadata['origin_server'] !== $this->getServerId()) {
+                $this->broadcastToChannel($channelName, $data);
+                $this->logger?->debug("Mensaje Redis transmitido a canal: $channelName");
+            } else {
+                $this->logger?->debug("Mensaje Redis no transmitido a canal: $channelName (mismo servidor?) [$message]");
+            }
+
+        } catch (\Exception $e) {
+            $this->logger?->error('Error procesando mensaje Redis: ' . $e->getMessage());
         }
     }
 
@@ -1156,11 +1539,6 @@ class Fluxus extends Server
         return $this->rpcMethods;
     }
 
-    public function getRpcMethod(string $method): callable|null
-    {
-        return $this->rpcMethods->get($method);
-    }
-
     /**
      * Envía resultado RPC al cliente
      */
@@ -1221,37 +1599,6 @@ class Fluxus extends Server
     public function generateRpcId(): string
     {
         return uniqid('rpc_', false) . '_' . (++$this->rpcRequestCounter);
-    }
-
-
-    /**
-     * Maneja mensajes entre workers vía sendMessage
-     */
-    public function handlePipeMessage(Server $server, int $srcWorkerId, string $message): void
-    {
-        $currentWorkerId = $this->getWorkerId();
-        $this->logger?->debug("📨 PipeMessage recibido en worker #{$currentWorkerId} desde worker #{$srcWorkerId}");
-
-        try {
-            $data = json_decode($message, true);
-            if (!$data || !isset($data['action'])) {
-                return;
-            }
-
-            if ($data['action'] === 'rpc' && isset($data['method'])) {
-                $this->handleBroadcastRpc($data, $srcWorkerId);
-            }
-
-            if ($data['action'] === 'broadcast_collect') {
-                $this->handleBroadcastCollect($data, $srcWorkerId);
-            }
-            if ($data['action'] === 'collect_response') {
-                $this->handleCollectResponse($server, $data, $srcWorkerId);
-            }
-
-        } catch (\Exception $e) {
-            $this->logger?->error("❌ Error en pipeMessage: " . $e->getMessage());
-        }
     }
 
     private function handleCollectResponse(Server $server, array $data, int $srcWorkerId): void
@@ -1342,6 +1689,42 @@ class Fluxus extends Server
         $method = $data['method'] ?? '';
         $params = $data['params'] ?? [];
         $currentWorkerId = $this->getWorkerId();
+        $methodInfo = $this->getRpcMethodInfo($method);
+        $fd = 0;
+        $parameters = [];
+        if ($methodInfo['parameters']) {
+            $trace = [];
+            if (count($methodInfo['parameters']) === 1 && $methodInfo['parameters'][array_key_first($methodInfo['parameters'])]['name'] === 'paramsArray' && !isset($params['paramsArray'])) {
+                $parameters = $params;
+            } else {
+                foreach ($methodInfo['parameters'] as $parameter) {
+                    if ($parameter['name'] === 'fd') {
+                        $parameters['fd'] = $params['fd'] ?? $fd;
+                        continue;
+                    }
+                    if ($parameter['name'] === 'server') {
+                        $parameters['server'] = $params['server'] ?? $this;
+                        continue;
+                    }
+                    if ($parameter['name'] === 'workerId') {
+                        $parameters['workerId'] = $params['workerId'] ?? $currentWorkerId;
+                        continue;
+                    }
+                    if ($parameter['name'] === 'requestId') {
+                        $parameters['requestId'] = $data['request_id'] ?? $params['requestId'] ?? '';
+                        continue;
+                    }
+                    $required = $parameter['required'] ?? true;
+                    $value = $params[$parameter['name']] ?? $parameter['default'];
+                    if ($required && !$value) {
+                        throw new InvalidArgumentException("Parameter '{$parameter['name']}' is required");
+                    }
+                    $parameters[$parameter['name']] = $value;
+                }
+            }
+        } else {
+            $parameters = $params;
+        }
 
         $this->logger?->info("🔁 Ejecutando RPC broadcast: {$method} en worker #{$currentWorkerId}");
 
@@ -1353,7 +1736,7 @@ class Fluxus extends Server
 
         try {
             // Ejecutar el método (usar FD 0 o null para indicar broadcast interno)
-            $result = $this->rpcHandlers[$method]($this, $params, 0);
+            $result = $this->rpcHandlers[$method](...$parameters);
 
             $this->logger?->info("✅ RPC broadcast ejecutado: {$method} en worker #{$currentWorkerId}");
 
@@ -1375,43 +1758,97 @@ class Fluxus extends Server
         }
     }
 
-    public function handleTask(Server $server, Task $task): void
+    /**
+     * Ejecuta un método RPC en una corutina separada con timeout
+     * @throws InvalidArgumentException
+     */
+    public function executeRpcMethod(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
     {
-        $data = $task->data;
-
-        if (isset($data['type'], $data['method'], $this->rpcHandlers[$data['method']]) && $data['type'] === 'broadcast_task') {
-            // Este task worker debe notificar a todos los workers normales
-            // usando sendMessage
-            $message = json_encode([
-                'action' => 'rpc',
-                'method' => $data['method'],
-                'params' => $data['params'] ?? [],
-                'timestamp' => time()
-            ], JSON_THROW_ON_ERROR);
-
-            $totalWorkers = $server->setting['worker_num'] ?? 1;
-            for ($i = 0; $i < $totalWorkers; $i++) {
-                $server->sendMessage($message, $i);
+        $methodInfo = $this->getRpcMethodInfo($method);
+        $coroutine = $methodInfo['coroutine'] ?? true;
+        $parameters = [];
+        if ($methodInfo['parameters']) {
+            $trace = [];
+            if (count($methodInfo['parameters']) === 1 && $methodInfo['parameters'][array_key_first($methodInfo['parameters'])]['name'] === 'paramsArray' && !isset($params['paramsArray'])) {
+                $parameters = $params;
+            } else {
+                foreach ($methodInfo['parameters'] as $parameter) {
+                    if ($parameter['name'] === 'fd') {
+                        $parameters['fd'] = $params['fd'] ?? $fd;
+                        continue;
+                    }
+                    if ($parameter['name'] === 'server') {
+                        $parameters['server'] = $params['server'] ?? $this;
+                        continue;
+                    }
+                    if ($parameter['name'] === 'workerId') {
+                        $parameters['workerId'] = $params['workerId'] ?? $workerId;
+                        continue;
+                    }
+                    if ($parameter['name'] === 'requestId') {
+                        $parameters['requestId'] = $params['requestId'] ?? $requestId;
+                        continue;
+                    }
+                    $required = $parameter['required'] ?? true;
+                    $value = $params[$parameter['name']] ?? $parameter['default'];
+                    if ($required && !$value) {
+                        throw new InvalidArgumentException("Parameter '{$parameter['name']}' is required");
+                    }
+                    if($value) {
+                        $parameters[$parameter['name']] = $value;
+                    }
+                }
             }
+        } else {
+            $parameters = $params;
         }
-        $task->finish("Task completed");
+        if (!$coroutine) {
+            $this->execRpc($fd, $requestId, $method, $parameters, $workerId);
+        } else {
+            $this->execRpcCoroutine($fd, $requestId, $method, $parameters, $timeout, $workerId);
+        }
     }
 
     /**
-     * Ejecuta un método RPC en una corutina separada con timeout
+     * Registra una coroutine RPC para poder gestionarla
      */
-    public function executeRpcMethod(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId, bool $coroutine = true): void
+    private function trackRpcCoroutine(string $requestId, int $coroutineId): void
     {
-        if (!$coroutine) {
-            $this->executeRpcMethodInline($fd, $requestId, $method, $params, $timeout, $workerId);
-            return;
+        $this->cancelableCids[] = $coroutineId;
+
+        // Opcional: almacenar en tabla para mejor gestión
+        if ($this->rpcRequests->exist($requestId)) {
+            $request = $this->rpcRequests->get($requestId);
+            $request['coroutine_id'] = $coroutineId;
+            $this->rpcRequests->set($requestId, $request);
         }
+    }
+
+    /**
+     * Limpia recursos de la coroutine
+     */
+    private function cleanupCoroutineResources(string $requestId): void
+    {
+        // Eliminar de la lista de cancelables
+        if ($this->rpcRequests->exist($requestId)) {
+            $request = $this->rpcRequests->get($requestId);
+            if (isset($request['coroutine_id'])) {
+                $coroutineId = $request['coroutine_id'];
+                $this->cancelableCids = array_filter(
+                    $this->cancelableCids,
+                    fn($cid) => $cid !== $coroutineId
+                );
+            }
+        }
+    }
+
+    private function execRpcCoroutine(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
+    {
         $timeoutMs = $timeout * 1000;
         // Crear coroutine para ejecutar el RPC
         $coroutineId = Coroutine::create(function () use ($fd, $requestId, $method, $params, $timeoutMs, $workerId) {
             try {
                 $this->logger?->debug("▶️  Iniciando coroutine para RPC en worker #{$workerId}: $method (ID: $requestId)" . ($timeoutMs > 0 ? " con timeout de {$timeoutMs}ms" : ""));
-
                 // Verificar que el método existe
                 if (!isset($this->rpcHandlers[$method])) {
                     $this->logger?->error("💥 Método desapareció durante ejecución en worker #{$workerId}: $method");
@@ -1419,14 +1856,12 @@ class Fluxus extends Server
                     $this->updateRpcRequest($requestId, 'failed');
                     return;
                 }
-
                 // Actualizar estado a procesando
                 $this->updateRpcRequest($requestId, 'processing');
 
                 $startTime = microtime(true);
                 $handler = $this->rpcHandlers[$method];
-
-                $result = null;
+                $metadata = $this->rpcMetadata[$method];
                 $timedOut = false;
 
                 // Si hay timeout, usar un temporizador
@@ -1439,12 +1874,15 @@ class Fluxus extends Server
                     });
 
                     // Ejecutar handler en otra coroutine
-                    Coroutine::create(function () use ($handler, $params, $fd, $timeoutChannel) {
+                    Coroutine::create(function () use ($handler, $params, $timeoutChannel, $method) {
                         try {
-                            $result = $handler($this, $params, $fd);
+                            //$result = $handler($this, $params, $fd);
+                            $result = $handler(...$params);
+
                             $timeoutChannel->push(['result' => $result, 'success' => true]);
-                        } catch (\Exception $e) {
-                            $timeoutChannel->push(['error' => $e, 'success' => false]);
+                        } catch (\Throwable $e) {
+                            $timeoutChannel->push(['error' => "Error executing method $method, {$e->getMessage()}", 'success' => false]);
+                            $this->logger?->error("❌❌❌ Error executing method $method, {$e->getMessage()}");
                         }
                     });
 
@@ -1467,7 +1905,7 @@ class Fluxus extends Server
                     $result = $channelResult['result'];
                 } else {
                     // Sin timeout
-                    $result = $handler($this, $params, $fd, $requestId);
+                    $result = $handler(...$params);
                 }
 
                 $executionTime = round((microtime(true) - $startTime) * 1000, 2);
@@ -1508,42 +1946,9 @@ class Fluxus extends Server
     }
 
     /**
-     * Registra una coroutine RPC para poder gestionarla
-     */
-    private function trackRpcCoroutine(string $requestId, int $coroutineId): void
-    {
-        $this->cancelableCids[] = $coroutineId;
-
-        // Opcional: almacenar en tabla para mejor gestión
-        if ($this->rpcRequests->exist($requestId)) {
-            $request = $this->rpcRequests->get($requestId);
-            $request['coroutine_id'] = $coroutineId;
-            $this->rpcRequests->set($requestId, $request);
-        }
-    }
-
-    /**
-     * Limpia recursos de la coroutine
-     */
-    private function cleanupCoroutineResources(string $requestId): void
-    {
-        // Eliminar de la lista de cancelables
-        if ($this->rpcRequests->exist($requestId)) {
-            $request = $this->rpcRequests->get($requestId);
-            if (isset($request['coroutine_id'])) {
-                $coroutineId = $request['coroutine_id'];
-                $this->cancelableCids = array_filter(
-                    $this->cancelableCids,
-                    fn($cid) => $cid !== $coroutineId
-                );
-            }
-        }
-    }
-
-    /**
      * Ejecuta un método RPC en una corutina
      */
-    private function executeRpcMethodInline(int $fd, string $requestId, string $method, array $params, int $timeout, int $workerId): void
+    private function execRpc(int $fd, string $requestId, string $method, array $params, int $workerId): void
     {
         try {
             $this->logger?->debug("▶️  Ejecutando RPC en worker #{$workerId}: $method (ID: $requestId)");
@@ -1563,7 +1968,7 @@ class Fluxus extends Server
 
             try {
                 // Ejecutar handler
-                $result = $handler($this, $params, $fd, $requestId);
+                $result = $handler(...$params);
                 $executionTime = round((microtime(true) - $startTime) * 1000, 2);
                 // Agregar metadata al resultado
                 if (is_array($result)) {
@@ -1591,7 +1996,7 @@ class Fluxus extends Server
 
         } catch (\Exception $e) {
             $this->logger?->error("💥 Error crítico en RPC worker #{$workerId}: " . $e->getMessage());
-            $this->sendRpcError($fd, $requestId, 'Error interno del servidor');
+            $this->sendRpcError($fd, $requestId, '💥 Error interno del servidor ' . $e->getMessage());
             $this->updateRpcRequest($requestId, 'failed');
         }
     }
@@ -1599,49 +2004,48 @@ class Fluxus extends Server
     /**
      * Registra un método RPC (puede ser llamado por múltiples workers)
      */
-    public function registerRpcMethod(
-        string   $method,
-        callable $handler,
-        bool     $requires_auth = false,
-        array    $allowed_roles = ['ws:general'],
-        string   $description = '',
-        bool     $only_internal = false,
-        bool     $coroutine = true
-    ): bool
+    public function registerRpcMethod(MethodConfig $method): bool
     {
         $workerId = $this->getWorkerId();
         if (!isset($this->rpcHandlers)) {
             $this->rpcHandlers = [];
         }
         if (!isset($this->rpcMethods)) {
-            $this->rpcMethodsQueue[] = func_get_args();
+            $this->rpcMethodsQueue[] = $method;
             return true;
         }
 
         // Verificar solo si YA ESTÁ REGISTRADO EN ESTE WORKER
-        if (isset($this->rpcHandlers[$method])) {
-            $this->logger?->debug("Método $method ya registrado en worker #$workerId");
+        if (isset($this->rpcHandlers[$method->method])) {
+            $this->logger?->debug("Método $method->method ya registrado en worker #$workerId");
             return false;
         }
 
         // Guardar handler en ESTE worker
-        $this->rpcHandlers[$method] = $handler;
-        $roles = !empty($allowed_roles) ? implode('|', $allowed_roles) : '';
+        $this->rpcHandlers[$method->method] = $method->handler;
+        $roles = !empty($method->allowed_roles) ? implode('|', $method->allowed_roles) : '';
         // Solo el primer worker que encuentre el método vacío en la tabla lo registra
-        if (!$this->rpcMethods->exist($method)) {
-            $this->rpcMethods->set($method, [
-                'name' => $method,
-                'description' => $description,
-                'requires_auth' => $requires_auth ? 1 : 0,
+        if (!$this->rpcMethods->exist($method->method)) {
+            $this->rpcMethods->set($method->method, [
+                'name' => $method->method,
+                'description' => $method->description,
+                'requires_auth' => $method->requires_auth ? 1 : 0,
                 'allowed_roles' => $roles,
                 'registered_by_worker' => $workerId,
-                'only_internal' => $only_internal ? 1 : 0,
-                'coroutine' => $coroutine ? 1 : 0,
+                'only_internal' => $method->only_internal ? 1 : 0,
+                'coroutine' => $method->coroutine ? 1 : 0,
                 'registered_at' => time()
             ]);
-            $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method para los roles $roles");
+            // Guardar metadatos
+            $this->rpcMetadata[$method->method] = [
+                'parameters' => isset($method->parameters) ? $method->parameters->toArray() : [],
+                'returns' => $method->returns,
+                'description' => $method->description,
+                'examples' => $method->examples, // Podrías añadir ejemplos
+            ];
+            $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method->method para los roles $roles");
         } else {
-            $this->logger?->debug("📝 Método $method ya en tabla, solo registrando handler en worker #$workerId");
+            $this->logger?->debug("📝 Método $method->method ya en tabla, solo registrando handler en worker #$workerId");
         }
 
         return true;
@@ -1650,8 +2054,29 @@ class Fluxus extends Server
     public function registerRpcMethods(MethodsCollection $collection): void
     {
         foreach ($collection as $method) {
-            $this->registerRpcMethod(...$method->toArray());
+            $this->registerRpcMethod($method);
         }
+    }
+
+    public function getRpcMethodInfo(string $methodName): array
+    {
+        if (!$this->rpcMethods->exist($methodName)) {
+            return [];
+        }
+        $baseData = $this->rpcMethods->get($methodName);
+        $info = array_merge($baseData, $this->rpcMetadata[$methodName] ?? []);
+        $info['allowed_roles'] = !empty($info['allowed_roles']) ? explode('|', $info['allowed_roles']) : [];
+        $info['requires_auth'] = (bool)($info['requires_auth'] ?? false);
+        return $info;
+    }
+
+    public function getRpcMethodsInfo(): array
+    {
+        $info = [];
+        foreach ($this->rpcMethods as $method) {
+            $info[] = $this->getRpcMethodInfo($method['name']);
+        }
+        return $info;
     }
 
     public function registerInternalRpcProcessor(string $processorName, RpcInternalPorcessorInterface $processor): void
@@ -1687,6 +2112,8 @@ class Fluxus extends Server
             $processor->init($this);
         }
     }
+
+
     // END RPC RELATED METHODS
 
     // AUTH RELATED METHODS
