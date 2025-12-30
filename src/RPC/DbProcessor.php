@@ -25,7 +25,7 @@ use Tabula17\Satelles\Utilis\Connectable\HealthManagerInterface;
 use Tabula17\Satelles\Utilis\Exception\RuntimeException;
 use Throwable;
 
-class DbProcessor implements RpcInternalPorcessorInterface
+class DbProcessor implements RpcInternalProcessorInterface
 {
     /**
      * @param Connector $connector
@@ -384,7 +384,7 @@ class DbProcessor implements RpcInternalPorcessorInterface
         $this->connector->closeAllPools();
     }
 
-    public function fetchRpcMethods(Fluxus $server): ?MethodsCollection
+    public function publishRpcMethods(Fluxus $server): ?MethodsCollection
     {
         $logger = $server->logger ?? $this->logger;
         $connector = $this->connector;

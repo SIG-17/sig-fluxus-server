@@ -19,17 +19,31 @@ use Tabula17\Satelles\Utilis\Config\AbstractDescriptor;
  */
 class Action extends AbstractDescriptor
 {
+    // PUB-SUB RELATED
     protected(set) string $subscribe = 'subscribe';
     protected(set) string $unsubscribe = 'unsubscribe';
-    protected(set) string $rpc = 'rpc';
     protected(set) string $publish = 'publish';
-    protected(set) string $listRpcMethods = 'list_rpc_methods';
     protected(set) string $listChannels = 'list_channels';
+    // END PUB-SUB RELATED
+
+    // RPC RELATED
+    protected(set) string $rpc = 'rpc';
+    protected(set) string $listRpcMethods = 'list_rpc_methods';
+    // END RPC RELATED
+
+    // FILE RELATED
     protected(set) string $sendFile = 'send_file';
     protected(set) string $requestFile = 'request_file';
     protected(set) string $startFileTransfer = 'start_file_transfer';
     protected(set) string $fileChunk = 'file_chunk';
+    protected(set) string $listFiles = 'list_files';
+    protected(set) string $deleteFile = 'delete_file';
+    protected(set) string $getTransferInfo = 'get_transfer_info';
+    // END FILE RELATED
+
+    // AUTH RELATED
     protected(set) string $authenticate = 'authenticate';
+    // END AUTH RELATED
 
     public function getProtocolFor(array $data)
     {

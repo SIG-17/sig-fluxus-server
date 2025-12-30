@@ -10,11 +10,14 @@ use SIG\Server\Config\MethodConfig;
 use SIG\Server\Exception\AuthenticationException;
 use SIG\Server\Exception\InvalidArgumentException;
 use SIG\Server\Exception\UnexpectedValueException;
+use SIG\Server\File\FileManagerInterface;
+use SIG\Server\File\FileProcessorInterface;
+use SIG\Server\File\FileStorageInterface;
 use SIG\Server\Protocol\Request\Action;
 use SIG\Server\Protocol\Request\RequestHandlerInterface;
 use SIG\Server\Protocol\Response\Type;
 use SIG\Server\Protocol\Status;
-use SIG\Server\RPC\RpcInternalPorcessorInterface;
+use SIG\Server\RPC\RpcInternalProcessorInterface;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 use Swoole\Http\Response;
@@ -129,6 +132,10 @@ class Fluxus extends Server
      */
     private bool $signalsConfigured = false;
     public int $workerId = -1;
+    private ?FileStorageInterface $fileStorage = null;
+    private ?FileProcessorInterface $fileProcessor = null;
+    private array $fileTransfers = [];
+    private FileManagerInterface $fileManager;
 
     public function __construct(
         TCPServerConfig                  $config,
@@ -397,6 +404,20 @@ class Fluxus extends Server
         $this->onPrivateEvent('task', [$this, 'handleTask']);;
     }
 
+    /**
+     * Configura el sistema de archivos
+     */
+    public function setFileManager(FileManagerInterface $manager): void
+    {
+        $this->fileManager = $manager;
+        $this->logger?->info('File manager configured');
+    }
+
+    public function getFileManager(): ?FileManagerInterface
+    {
+        return $this->fileManager;
+    }
+
     // END SETUP AND INIT RELATED METHODS
 
     // SERVER HOOKED METHODS
@@ -554,7 +575,7 @@ class Fluxus extends Server
         $workerId = $this->getWorkerId() ?? $this->workerId;
         $this->logger?->debug("$logPrefix Worker #$workerId: Limpiando procesadores RPC..." . var_export($workerId, true));
         foreach ($this->rpcInternalProcessors as $processor) {
-            if ($processor instanceof RpcInternalPorcessorInterface) {
+            if ($processor instanceof RpcInternalProcessorInterface) {
                 $processor->deInit($this);
             }
         }
@@ -654,23 +675,37 @@ class Fluxus extends Server
     public function handleTask(Server $server, Task $task): void
     {
         $data = $task->data;
+        $endMessage = 'Task processed';
+        switch ($data['type'] ?? '') {
+            case 'broadcast_task':
+                if (isset($data['method']) && isset($this->rpcHandlers[$data['method']])) {
+                    $message = json_encode([
+                        'action' => 'rpc',
+                        'method' => $data['method'],
+                        'params' => $data['params'] ?? [],
+                        'timestamp' => time()
+                    ], JSON_THROW_ON_ERROR);
 
-        if (isset($data['type'], $data['method'], $this->rpcHandlers[$data['method']]) && $data['type'] === 'broadcast_task') {
-            // Este task worker debe notificar a todos los workers normales
-            // usando sendMessage
-            $message = json_encode([
-                'action' => 'rpc',
-                'method' => $data['method'],
-                'params' => $data['params'] ?? [],
-                'timestamp' => time()
-            ], JSON_THROW_ON_ERROR);
+                    $totalWorkers = $server->setting['worker_num'] ?? 1;
+                    for ($i = 0; $i < $totalWorkers; $i++) {
+                        $server->sendMessage($message, $i);
+                    }
+                    $endMessage = 'Broadcast task processed. Sent to all workers (' . $totalWorkers . ')';
+                }
+                break;
+            /* case 'assemble_file':
+                 $this->assembleFileTask($data['file_id']);
+                 break;
 
-            $totalWorkers = $server->setting['worker_num'] ?? 1;
-            for ($i = 0; $i < $totalWorkers; $i++) {
-                $server->sendMessage($message, $i);
-            }
+             case 'process_file':
+                 $this->processFileTask(
+                     $data['file_id'],
+                     $data['file_info'],
+                     $data['metadata']
+                 );
+                 break;*/
         }
-        $task->finish("Task completed");
+        $task->finish(['status' => 'processed', 'message' => $endMessage]);
     }
     // END SERVER RELATED METHODS
 
@@ -896,9 +931,9 @@ class Fluxus extends Server
                 $html = file_get_contents(__DIR__ . '/rpc-docs.html');
 
                 $response->end(str_replace(['{{host}}', '{{port}}'], [$this->host, $this->port], $html));
-               /* $methods = $this->exposeRpcMethods();
-                $js = $this->generateRPCDocumentation($methods);
-                $response->end($js);*/
+                /* $methods = $this->exposeRpcMethods();
+                 $js = $this->generateRPCDocumentation($methods);
+                 $response->end($js);*/
                 break;
             case '/api/rpc-methods':
                 $response->header('Content-Type', 'application/json');
@@ -1794,7 +1829,7 @@ JS;
                     if ($required && !$value) {
                         throw new InvalidArgumentException("Parameter '{$parameter['name']}' is required");
                     }
-                    if($value) {
+                    if ($value) {
                         $parameters[$parameter['name']] = $value;
                     }
                 }
@@ -2079,7 +2114,7 @@ JS;
         return $info;
     }
 
-    public function registerInternalRpcProcessor(string $processorName, RpcInternalPorcessorInterface $processor): void
+    public function registerInternalRpcProcessor(string $processorName, RpcInternalProcessorInterface $processor): void
     {
         if (isset($this->rpcInternalProcessors[$processorName]) && $this->rpcInternalProcessors[$processorName] === $processor) {
             $this->logger?->warning('Processor ' . $processorName . ' already registered as internal RPC processor. Skipping...');
@@ -2090,13 +2125,13 @@ JS;
             $processor->init($this);
         }
         $this->rpcInternalProcessors[$processorName] = $processor;
-        if ($processor->fetchRpcMethods($this)) {
+        if ($processor->publishRpcMethods($this)) {
             $this->logger?->debug('🥌 -> Registering RPC methods for internal RPC processor ' . $processorName);
-            $this->registerRpcMethods($processor->fetchRpcMethods($this));
+            $this->registerRpcMethods($processor->publishRpcMethods($this));
         }
     }
 
-    public function getInternalRpcProcessor(string $processorName): ?RpcInternalPorcessorInterface
+    public function getInternalRpcProcessor(string $processorName): ?RpcInternalProcessorInterface
     {
         return $this->rpcInternalProcessors[$processorName] ?? null;
     }
@@ -2115,6 +2150,19 @@ JS;
 
 
     // END RPC RELATED METHODS
+
+    // PROTOCOL RELATED METHODS
+    public function sendProtocolResponse(string $protocolResponse, int $fd, array $data): void
+    {
+        if (!$this->responseProtocol->offsetExists($protocolResponse)) {
+            $this->sendError($fd, 'Unknow response for protocol: ' . $protocolResponse);
+        } else {
+            $response = $this->responseProtocol->getProtocolFor(array_merge($data, ['type' => $protocolResponse]));
+
+            $this->sendToClient($fd, $response);
+        }
+    }
+    // END PROTOCOL RELATED METHODS
 
     // AUTH RELATED METHODS
     /**
