@@ -3,6 +3,8 @@
 use SIG\Server\Collection\MethodsCollection;
 use SIG\Server\Collection\MethodsSetCollection;
 use SIG\Server\Fluxus;
+use SIG\Server\PubSub\PubSubManager;
+
 $base = [
     [
         'method' => 'ping',
@@ -72,7 +74,6 @@ $base = [
                 'worker_pid' => posix_getpid(),
                 'memory_usage' => round(memory_get_usage(true) / 1024 / 1024, 2) . ' MB',
                 'handlers_count' => count($server->rpcHandlers),
-                'initialized' => $server->initialized,
                 'timestamp' => time()
             ];
         }
@@ -85,7 +86,9 @@ $base = [
         'only_internal' => false,
         'handler' => static function (Fluxus $server, $params, $fd) {
             $channels = [];
-            foreach ($server->channels as $channel) {
+            /**@var PubSubManager $protocol */
+            $protocol = $server->getProtocolManager('pubsub');
+            foreach ($protocol->channels as $channel) {
                 $channels[] = [
                     'name' => $channel['name'],
                     'subscribers' => $channel['subscriber_count'],

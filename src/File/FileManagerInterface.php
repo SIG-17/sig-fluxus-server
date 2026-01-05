@@ -2,7 +2,9 @@
 
 namespace SIG\Server\File;
 
-interface FileManagerInterface
+use SIG\Server\Protocol\ProtocolManagerInterface;
+
+interface FileManagerInterface extends ProtocolManagerInterface
 {
     /**
      * Inicia una transferencia de archivo por chunks

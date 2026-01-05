@@ -2,26 +2,34 @@
 
 namespace SIG\Server\File;
 
+use SIG\Server\Collection\MethodsCollection;
+use SIG\Server\Config\MethodConfig;
 use SIG\Server\Fluxus;
+use SIG\Server\Protocol\Request\Action;
+use SIG\Server\Protocol\Response\Type;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
+use Swoole\Http\Request;
 use Swoole\Table;
+use Swoole\WebSocket\Server;
 
 class FileManager implements FileManagerInterface
 {
     private Table $activeTransfers;
-    private ?FileStorageInterface $storage;
-    private ?FileProcessorInterface $processor;
     private array $config;
+    private int|false $cleanUpTimer;
 
     public function __construct(
-        private readonly Fluxus $server,
-        ?FileStorageInterface   $storage = null,
-        ?FileProcessorInterface $processor = null,
-        array                   $config = []
-    ) {
-        $this->storage = $storage;
-        $this->processor = $processor;
+        private readonly Fluxus                  $server,
+        public readonly Action                   $protocol,
+        public readonly Type                     $responses,
+        private readonly ?FileStorageInterface   $storage = null,
+        private readonly ?FileProcessorInterface $processor = null,
+        array                                    $config = []
+    )
+    {
+        // $this->storage = $storage;
+        //$this->processor = $processor;
         $this->config = array_merge([
             'max_file_size' => 100 * 1024 * 1024, // 100MB
             'max_chunk_size' => 64 * 1024, // 64KB
@@ -63,7 +71,7 @@ class FileManager implements FileManagerInterface
     private function startCleanupTimer(): void
     {
         // Limpiar transferencias antiguas periódicamente
-        swoole_timer_tick($this->config['cleanup_interval'] * 1000, function() {
+        $this->cleanUpTimer = swoole_timer_tick($this->config['cleanup_interval'] * 1000, function () {
             $this->cleanupOldTransfers();
         });
     }
@@ -881,5 +889,43 @@ class FileManager implements FileManagerInterface
             'get_transfer_info' => $this->getTransferInfo($fd, $data),
             default => ['success' => false, 'error' => "Unknown file action: {$action}"],
         };
+    }
+
+    public function initializeOnStart(): void
+    {
+        if (!$this->cleanUpTimer) {
+            $this->startCleanupTimer();
+        }
+    }
+
+    public function initializeOnWorkers()
+    {
+        // TODO: Implement initializeOnWorkers() method.
+    }
+
+    public function cleanUpResources()
+    {
+        $this->cleanupOldTransfers();
+        swoole_timer_clear($this->cleanUpTimer);
+    }
+
+    public function runOnOpenConnection(Server $server, Request $request): void
+    {
+        // TODO: Implement runOnOpenConnection() method.
+    }
+
+    public function runOnCloseConnection(Server $server, int $fd): void
+    {
+        // TODO: Implement runOnCloseConnection() method.
+    }
+
+    public function registerRpcMethods(MethodsCollection $collection): void
+    {
+        // TODO: Implement registerRpcMethods() method.
+    }
+
+    public function registerRpcMethod(MethodConfig $method): bool
+    {
+        // TODO: Implement registerRpcMethod() method.
     }
 }

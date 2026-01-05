@@ -294,7 +294,7 @@ class DbProcessor implements RpcInternalProcessorInterface
             //$this->healthManager?->startHealthCheckCycle($server, $server->getWorkerId());
             if ($workerId === false) {
                 $logger?->info("Master process es el coordinador de Health. Iniciando ciclo.");
-                $server->registerRpcMethod(new MethodConfig([
+                $server->getProtocolManager('rpc')?->registerRpcMethod(new MethodConfig([
                         'method' => $prefix . '.failures.retry.task',
                         'handler' => function () use ($server, $prefix) {
                             $taskData = [

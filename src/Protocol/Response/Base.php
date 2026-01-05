@@ -46,4 +46,8 @@ class Base extends AbstractDescriptor
         }
         parent::__construct($values);
     }
+    public function isValid(): bool
+    {
+        return !!$this->type;
+    }
 }

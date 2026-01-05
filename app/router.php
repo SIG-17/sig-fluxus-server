@@ -4,6 +4,16 @@ declare(strict_types=1);
 
 use SIG\Server\Collection\MethodsCollection;
 use SIG\Server\Config\MethodConfig;
+use SIG\Server\File\FileManager;
+use SIG\Server\File\Processor\BaseFileProcessor;
+use SIG\Server\File\Storage\RedisFileStorage;
+use SIG\Server\Protocol\Request\File\FileDefinition;
+use SIG\Server\Protocol\Request\PubSub\PubSubDefinition;
+use SIG\Server\Protocol\Request\Rpc\RpcDefinition;
+use SIG\Server\Protocol\Response\File\FileType;
+use SIG\Server\Protocol\Response\PubSub\PubSubType;
+use SIG\Server\Protocol\Response\Rpc\RpcType;
+use SIG\Server\Protocol\Response\Type;
 use SIG\Server\Protocol\Status;
 use Bramus\Monolog\Formatter\ColoredLineFormatter;
 use Monolog\Formatter\MongoDBFormatter;
@@ -13,8 +23,10 @@ use SIG\Server\Auth\FakeAuth;
 use SIG\Server\Collection\ChannelSetCollection;
 use SIG\Server\Collection\MethodsSetCollection;
 use SIG\Server\Config\ChannelConfig;
+use SIG\Server\PubSub\PubSubManager;
 use SIG\Server\RPC\DbProcessor;
 use SIG\Server\Fluxus;
+use SIG\Server\RPC\RpcManager;
 use Swoole\Runtime;
 use Tabula17\Satelles\Omnia\Roga\Database\Connector;
 use Tabula17\Satelles\Omnia\Roga\Database\HealthManager;
@@ -201,9 +213,40 @@ try {
     $logger->info("🎛️ * PID: " . getmypid());
     $logger->info("💡 Use 'systemctl stop servicio-websocket' o Ctrl+C para detener");
 
+    $pubsub = new PubSubManager(
+            server: $server,
+            protocol: new PubSubDefinition(),
+            responses: new PubSubType(),
+            logger: $logger
+    );
 
-    $server->registerInternalRpcProcessor('db', $db);
+    $server->addProtocol('pubsub', $pubsub);
+    $logger->info("📥 PUB/SUB MANAGER ** PROTOCOL: " . PubSubDefinition::PROTOCOL . " 📤");
 
+
+    $fileManager = new FileManager(
+            server: $server,
+            protocol: new FileDefinition(),
+            responses: new FileType(),
+            storage: new RedisFileStorage(),
+            processor: new BaseFileProcessor()
+    );
+    $server->addProtocol('file', $fileManager);
+    $logger->info("💾 FILE MANAGER ** PROTOCOL: " . FileDefinition::PROTOCOL . " 💾");
+
+    $rpcDefinition = new RpcDefinition();
+    $rpcResponses = new RpcType();
+    $rpc = new RpcManager(
+            server: $server,
+            protocol: $rpcDefinition,
+            responses: $rpcResponses,
+            logger: $logger,
+    );
+    $rpcProtocol = RpcDefinition::PROTOCOL;
+    $rpcProtoDefinition = implode(',', $rpc->protocol->toArray());
+    $rpc->registerInternalRpcProcessor('db', $db);
+    $logger->info("📦 RPC MANAGER ** PROTOCOL {$rpcProtocol}: {$rpcProtoDefinition} 📦");
+    // $server->registerInternalRpcProcessor('db', $db);
 
     $logger->info('🛣️ Buscando métodos RPC para inicializar, instancia: ' . $instance . '');
     $methodsCfgIterator = new RecursiveDirectoryIterator(__DIR__ . '/../config/rpc');
@@ -212,16 +255,16 @@ try {
         if ($file->getExtension() === 'php') {
             $methodCfg = require $file->getPathname();
             if ($methodCfg instanceof MethodsSetCollection && $methodCfg->offsetExists($instance)) {
-                $server->registerRpcMethods($methodCfg[$instance]);
+                $rpc->registerRpcMethods($methodCfg[$instance]);
             }
         }
     }
-
+    /**@var MethodsCollection $instanceMethods */
     $instanceMethods = MethodsCollection::fromArray(
             [
                     [
                             'method' => 'ws.shutdown',
-                            'handler' => function (Fluxus $server, $fd, $requestId) use ($logger) {
+                            'handler' => function (Fluxus $server, $fd, $requestId) use ($logger, $rpcResponses) {
                                 $logger->notice("Shutdown solicitado via RPC desde FD $fd");
                                 if (!$server->isRunning()) {
                                     return [
@@ -230,8 +273,8 @@ try {
                                     ];
                                 }
                                 // Enviar respuesta inmediata al cliente
-                                $response = $server->responseProtocol->getProtocolFor([
-                                        'type' => $server->responseProtocol->get('rpcSuccess'),
+                                $response = $rpcResponses->getProtocolFor([
+                                        'type' => $rpcResponses->get('rpcSuccess'),
                                         'id' => $requestId ?? '',
                                         'status' => Status::success,
                                         'message' => 'Shutdown iniciado, el servidor comenzará a cerrarse en 5 segundos',
@@ -260,12 +303,12 @@ try {
                     [
 
                             'method' => 'ws.reload',
-                            'handler' => function (Fluxus $server, $fd, $requestId) {
+                            'handler' => function (Fluxus $server, $fd, $requestId) use ($rpcResponses) {
                                 $server->logger->info("Forcing reload from client {$fd}");
                                 // Enviar respuesta
-                                $response = $server->responseProtocol->getProtocolFor(
+                                $response = $rpcResponses->getProtocolFor(
                                         [
-                                                'type' => $server->responseProtocol->get('rpcSuccess'),
+                                                'type' => $rpcResponses->get('rpcSuccess'),
                                                 'id' => $requestId ?? '',
                                                 'status' => Status::success,
                                                 'message' => 'Reload iniciado, el servidor iniciará el proceso en 5 segundos',
@@ -292,8 +335,8 @@ try {
                     ]
             ]
     );
-
-    $server->registerRpcMethods($instanceMethods);
+    $rpc->registerRpcMethods($instanceMethods);
+    $server->addProtocol('rpc', $rpc);
     /*    if ($server->setting['task_worker_num'] > 0) {
             $server->registerRpcMethod(
                     method: 'db.failures.retry.task',
@@ -423,7 +466,6 @@ try {
             ];
         });
         */
-
     $server->onAfter('start', function () use ($logger, $instance, $server, $pidFile) {
         // Guardar nuestro PID cuando el servidor inicie
         $masterPid = $server->master_pid;
@@ -448,7 +490,7 @@ try {
                     foreach ($channelCfg[$instance] as $channel) {
                         if ($channel instanceof ChannelConfig) {
                             $logger->debug("Inicializando canal: {$channel->name}: " . json_encode($channel->toArray(), JSON_THROW_ON_ERROR));
-                            $server->addChannel(
+                            $server->getProtocolManager('pubsub')?->addChannel(
                                     channel: $channel->name,
                                     requireAuth: $channel->required_auth ?? false,
                                     requireRole: $channel->required_role ?? null,
@@ -461,22 +503,20 @@ try {
             }
         }
     });
-
-    $server->onBefore('shutdown', function () use ($logger, $healthManager, $connector, $server) {
+    $server->onBefore('shutdown', function () use ($logger, $server) {
         $workerId = $server->getWorkerId();
         $logger->debug("🛑 Worker #$workerId: Graceful shutdown starting...");
 
         // 1. Cerrar conexiones de DB
-        $logger->debug('🔐 Closing database connections...');
-        $connector->closeAllPools();
+        //$logger->debug('🔐 Closing database connections...');
+        //$connector->closeAllPools();
 
         // 2. Pequeña pausa
-        $server->safeSleep(0.05);
+        //$server->safeSleep(0.05);
     });
     $server->on('shutdown', function () use ($logger) {
         $logger->debug("🛑 Servidor apagado gracefulmente");
     });
-
     $server->onAfter('finish', function (Fluxus $server, int $taskId, $data) {
         $server->logger?->debug("Task #{$taskId} completado");
     });
