@@ -9,7 +9,11 @@ use Tabula17\Satelles\Utilis\Config\AbstractDescriptor;
 class MethodConfig extends AbstractDescriptor
 {
     protected(set) string $method;
-    protected(set) Closure $handler;
+    protected(set) Closure $handler {
+        set(callable|Closure $handler) {
+            $this->handler = $handler instanceof Closure ? $handler : $handler(...);
+        }
+    }
     protected(set) bool $requires_auth = false;
     protected(set) array $allowed_roles = ['ws:general'];
     protected(set) string $description = 'RPC Method';

@@ -407,6 +407,10 @@ class Fluxus extends Server
     {
         return $this->protocolsManager[$protocol] ?? null;
     }
+    public function getProtocolManagers(): array
+    {
+        return $this->protocolsManager;
+    }
 
     public function getRequestProtocol(string $protocol): ?Action
     {
@@ -971,9 +975,11 @@ class Fluxus extends Server
     public function handleClose(Server $server, int $fd): void
     {
         $this->logger?->info("Cliente desconectado: FD $fd");
-        foreach ($this->getAllProtocolManagers() as $protocolManager) {
+        foreach ($this->protocolsManager as $protocol => $protocolManager) {
+            $this->logger?->debug("Desconectando cliente $fd de Protocolo #$protocol");
             $protocolManager->runOnCloseConnection($server, $fd);
         }
+
     }
 
     /**

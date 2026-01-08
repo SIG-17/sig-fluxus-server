@@ -232,10 +232,17 @@ class DbProcessor implements RpcInternalProcessorInterface
         [$request, $builder] = $this->getRequestAndStatementBuilder($params);
         $identifier = $request->getFor();
         $this->logger?->debug('Buscando statement para ' . implode(': ', $identifier));
-        $builder->loadStatementBy(...$identifier)?->setValues($request->params ?? []);
-        $descriptor = $builder->getDescriptorBy(...$identifier);
+        try {
+            $builder->loadStatementBy(...$identifier)?->setValues($request->params ?? []);
+            $descriptor = $builder->getDescriptorBy(...$identifier);
+        } catch (\Throwable $e) {
+            $this->logger?->error('Error buscando descriptor mediante loadStatementBy para ' . $cfg . ' variante: ' . implode(': ', $identifier) . ': ' . $e->getTraceAsString());
+            throw $e;
+        }
         if ($descriptor === null) {
-            throw new \InvalidArgumentException(sprintf(ExceptionDefinitions::STATEMENT_NOT_FOUND_FOR_VARIANT->value, implode(': ', $identifier), $request->cfg ?? ''));
+            $err = 'Error buscando descriptor, loadStatementBy retorna NULL para ' . $cfg . ' variante: ' . implode(': ', $identifier);
+            $this->logger?->error($err);
+            throw new RuntimeException(sprintf(ExceptionDefinitions::STATEMENT_NOT_FOUND_FOR_VARIANT->value, implode(': ', $identifier), $request->cfg ?? ''));
         }
         $this->logger?->debug('Buscando conexión para ' . $builder->getMetadataValue('connection'));
 

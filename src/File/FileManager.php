@@ -7,13 +7,15 @@ use SIG\Server\Config\MethodConfig;
 use SIG\Server\Fluxus;
 use SIG\Server\Protocol\Request\Action;
 use SIG\Server\Protocol\Response\Type;
+use SIG\Server\PubSub\PubSubManager;
+use SIG\Server\RPC\RpcPublisherInterface;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 use Swoole\Http\Request;
 use Swoole\Table;
 use Swoole\WebSocket\Server;
 
-class FileManager implements FileManagerInterface
+class FileManager implements FileManagerInterface, RpcPublisherInterface
 {
     private Table $activeTransfers;
     private array $config;
@@ -746,8 +748,9 @@ class FileManager implements FileManagerInterface
             'timestamp' => time(),
             'metadata' => $metadata
         ];
-
-        $this->server->broadcastToChannel($channel, $message);
+        /**@var $pubsub PubSubManager */
+        $pubsub = $this->server->getProtocolManager('pubsub');
+        $pubsub?->broadcastToChannel($channel, $message);
     }
 
     /**
@@ -872,6 +875,12 @@ class FileManager implements FileManagerInterface
         return $stats;
     }
 
+    public function cleanupFiles(Fluxus $server, array $params, int $fd): array
+    {
+        // Implementar limpieza
+        return ['message' => 'Cleanup not implemented'];
+    }
+
     /**
      * Maneja cualquier acción de archivos
      */
@@ -898,12 +907,12 @@ class FileManager implements FileManagerInterface
         }
     }
 
-    public function initializeOnWorkers()
+    public function initializeOnWorkers(): void
     {
         // TODO: Implement initializeOnWorkers() method.
     }
 
-    public function cleanUpResources()
+    public function cleanUpResources(): void
     {
         $this->cleanupOldTransfers();
         swoole_timer_clear($this->cleanUpTimer);
@@ -919,13 +928,43 @@ class FileManager implements FileManagerInterface
         // TODO: Implement runOnCloseConnection() method.
     }
 
-    public function registerRpcMethods(MethodsCollection $collection): void
+    public function publishRpcMethods(Fluxus $server): ?MethodsCollection
     {
-        // TODO: Implement registerRpcMethods() method.
+
+        $collection = new MethodsCollection();
+
+        $collection->add(new MethodConfig(
+            [
+                'method' => 'files.stats',
+                'handler' => [$this, 'getStats'],
+                'description' => 'Get file transfer statistics',
+                'requires_auth' => true]
+        ));
+
+        $collection->add(new MethodConfig(
+            [
+                'method' => 'files.list',
+                'handler' => [$this, 'listFiles'],
+                'description' => 'List available files',
+                'requires_auth' => true,
+                'parameters' => [
+                    ['name' => 'channel', 'type' => 'string', 'required' => false],
+                    ['name' => 'limit', 'type' => 'int', 'required' => false, 'default' => 50]
+                ]]
+        ));
+
+        $collection->add(new MethodConfig(
+            [
+                'method' => 'files.cleanup',
+                'handler' => [$this, 'cleanupFiles'],
+                'description' => 'Clean up old files and transfers',
+                'requires_auth' => true,
+                'parameters' => [
+                    ['name' => 'max_age', 'type' => 'int', 'required' => false, 'default' => 3600]
+                ]]
+        ));
+
+        return $collection;
     }
 
-    public function registerRpcMethod(MethodConfig $method): bool
-    {
-        // TODO: Implement registerRpcMethod() method.
-    }
 }

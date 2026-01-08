@@ -51,15 +51,17 @@ class ListRpcMethods extends Base implements RequestHandlerInterface
         $server->logger?->debug('🗂️ Propiedad rpcHandlers contiene ' . count($rpc->rpcHandlers) . ' métodos');
         $server->logger?->debug('📟 Propiedad rpcMethods contiene ' . $rpc->getRpcMethods()->count());
         // Listar métodos disponibles en ESTE worker
-        foreach ($rpc->rpcHandlers as $methodName => $handler) {
+        $rpcHandlers =$rpc->rpcHandlers;
+        sort($rpcHandlers);
+        foreach ($rpcHandlers as $methodName => $handler) {
             $requiresAuth = false;
             $description = 'RPC method ' . $methodName;
             $registeredAt = 0;
             $auth_roles = [];
 
             // Verificar en tabla si existe metadata
-            if ($server->getRpcMethods()->exist($methodName)) {
-                $methodInfo = $server->getRpcMethods()->get($methodName);
+            if ($rpc->getRpcMethods()->exist($methodName)) {
+                $methodInfo = $rpc->getRpcMethods()->get($methodName);
                 $requiresAuth = (bool)$methodInfo['requires_auth'];
                 $auth_roles = !empty($methodInfo['allowed_roles']) ? explode(',', $methodInfo['allowed_roles']) : [];
                 $description = $methodInfo['description'];

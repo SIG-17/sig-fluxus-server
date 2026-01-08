@@ -37,12 +37,27 @@ class RpcManager implements RpcManagerInterface
         private readonly ?LoggerInterface $logger = null
     )
     {
-
+        $this->initRpcTables();
     }
 
     public function initializeOnStart(): void
     {
-        $this->initRpcTables();
+
+        while ($config = array_shift($this->rpcMethodsQueue)) {
+            if (is_array($config)) {
+                $this->logger?->debug("Intentando registrar " . var_export($config, true));
+            }
+            $this->registerRpcMethod($config);
+        }
+        foreach ($this->server->getProtocolManagers() as $protocolManager) {
+            if ($protocolManager instanceof RpcPublisherInterface) {
+                $collection = $protocolManager->publishRpcMethods($this->server);
+                if($collection) {
+                    $this->registerRpcMethods($collection);
+                }
+            }
+        }
+        //$this->initRpcTables();
         $this->initializeRpcInternalProcessors();
         $this->registerRpcHandlers();
         $this->registerHttpRequestHandlers();
@@ -50,7 +65,15 @@ class RpcManager implements RpcManagerInterface
 
     public function initializeOnWorkers()
     {
-        $this->initRpcTables();
+        // $this->initRpcTables();
+        foreach ($this->server->getProtocolManagers() as $protocolManager) {
+            if ($protocolManager instanceof RpcPublisherInterface) {
+                $collection = $protocolManager->publishRpcMethods($this->server);
+                if($collection) {
+                    $this->registerRpcMethods($collection);
+                }
+            }
+        }
         $this->initializeRpcInternalProcessors();
         $this->registerRpcHandlers();
         $this->registerHttpRequestHandlers();
@@ -75,12 +98,6 @@ class RpcManager implements RpcManagerInterface
         $this->rpcMethods->column('only_internal', Table::TYPE_INT, 1);
         $this->rpcMethods->column('coroutine', Table::TYPE_INT, 1);
         $this->rpcMethods->create();
-        while ($config = array_shift($this->rpcMethodsQueue)) {
-            if (is_array($config)) {
-                $this->logger?->debug("Intentando registrar " . var_export($config, true));
-            }
-            $this->registerRpcMethod($config);
-        }
 
         $this->rpcRequests = new Table(1024);
         $this->rpcRequests->column('request_id', Table::TYPE_STRING, 32);
@@ -113,6 +130,7 @@ class RpcManager implements RpcManagerInterface
         $this->server->registerTaskHandler('broadcast_task', [$this, 'handleBroadcastTask']);
 
     }
+
     public function handleMessages(Server $server, Frame $frame)
     {
 
@@ -131,6 +149,7 @@ class RpcManager implements RpcManagerInterface
             $server->sendError($frame->fd, 'Acción no reconocida: ' . $data['action']);
         }
     }
+
     public function handleBroadcastTask(Server $server, Frame $frame, int $srcWorkerId): string
     {
 
@@ -150,6 +169,7 @@ class RpcManager implements RpcManagerInterface
         }
         return 'No RPC method found';
     }
+
     private function registerHttpRequestHandlers(): void
     {
         $this->server->registerRequestHandler('/api/rpc', function ($request, $response) {
@@ -205,11 +225,17 @@ class RpcManager implements RpcManagerInterface
                         $response->end(file_get_contents(__DIR__ . '/../js/VecturaPubSub.js'));
                         break;*/
     }
-    // En tu Fluxus class, añade este método:
+
     public function exposeRpcMethods(): array
     {
         $methods = [];
-        foreach ($this->getRpcMethodsInfo() as $methodInfo) {
+        $rpcMethods = $this->getRpcMethodsInfo();
+
+        $names = array_column($rpcMethods, 'name');
+        array_multisort($names, SORT_ASC, $rpcMethods);
+
+
+        foreach ($rpcMethods as $methodInfo) {
             if ($methodInfo['only_internal'] ?? 0) {
                 continue;
             }
@@ -616,7 +642,7 @@ JS;
      */
     private function trackRpcCoroutine(string $requestId, int $coroutineId): void
     {
-        $this->cancelableCids[] = $coroutineId;
+        $this->server->cancelableCids[] = $coroutineId;
 
         // Opcional: almacenar en tabla para mejor gestión
         if ($this->rpcRequests->exist($requestId)) {
@@ -701,7 +727,7 @@ JS;
                     }
 
                     if ($channelResult['success'] === false) {
-                        throw $channelResult['error'];
+                        throw new \RuntimeException($channelResult['error']);
                     }
 
                     $result = $channelResult['result'];
@@ -838,17 +864,17 @@ JS;
                 'coroutine' => $method->coroutine ? 1 : 0,
                 'registered_at' => time()
             ]);
-            // Guardar metadatos
-            $this->rpcMetadata[$method->method] = [
-                'parameters' => isset($method->parameters) ? $method->parameters->toArray() : [],
-                'returns' => $method->returns,
-                'description' => $method->description,
-                'examples' => $method->examples, // Podrías añadir ejemplos
-            ];
             $this->logger?->debug("✅ Método RPC registrado en tabla por worker #$workerId: $method->method para los roles $roles");
         } else {
             $this->logger?->debug("📝 Método $method->method ya en tabla, solo registrando handler en worker #$workerId");
         }
+        // Guardar metadatos en worker!
+        $this->rpcMetadata[$method->method] = [
+            'parameters' => isset($method->parameters) ? $method->parameters->toArray() : [],
+            'returns' => $method->returns,
+            'description' => $method->description,
+            'examples' => $method->examples, // Podrías añadir ejemplos
+        ];
 
         return true;
     }
@@ -892,10 +918,8 @@ JS;
             $processor->init($this->server);
         }
         $this->rpcInternalProcessors[$processorName] = $processor;
-        if ($processor->publishRpcMethods($this->server)) {
-            $this->logger?->debug('🥌 -> Registering RPC methods for internal RPC processor ' . $processorName);
-            $this->registerRpcMethods($processor->publishRpcMethods($this->server));
-        }
+        $this->logger?->debug('🥌 -> Registering RPC methods for internal RPC processor ' . $processorName);
+        $this->registerRpcMethods($processor->publishRpcMethods($this->server));
     }
 
     public function getInternalRpcProcessor(string $processorName): ?RpcInternalProcessorInterface

@@ -570,7 +570,7 @@
                     const div = document.createElement('div');
                     div.classList.add('statements');
                     div.innerText = '🛍️ Available statements descriptors:'
-                    for (const statement of Object.entries(data)) {
+                    for (const statement of Object.entries(data.statements)) {
                         if (statement[0].startsWith('_')) continue;
                         const statementDiv = document.createElement('button');
                         statementDiv.classList.add('pure-button-primary', 'pure-button', 'statement');
@@ -658,9 +658,11 @@
                             const cfg = {
                                 forceReload: false,
                                 cfg: data.cfg,
-                                params: prepareParams(variant.params)
+                                variant: currentVariant === '*' ? 1 : currentVariant,
+                                variantMember: variant.variantMember,
+                                params: prepareParams(variant.params),
                             }
-                            cfg[variant.variantMember] = currentVariant === '*' ? 1 : currentVariant;
+                           // cfg[variant.variantMember] = currentVariant === '*' ? 1 : currentVariant;
                             console.log('Get SQL statement for variant:', cfg)
                             rpcProcessors['default']('db.get.statement.for', cfg);
                         })
@@ -672,10 +674,12 @@
                             const cfg = {
                                 forceReload: false,
                                 cfg: data.cfg,
-                                params: prepareParams(variant.params)
+                                variant: currentVariant === '*' ? 1 : currentVariant,
+                                variantMember: variant.variantMember,
+                                params: prepareParams(variant.params),
                             }
 
-                            cfg[variant.variantMember] = currentVariant === '*' ? 1 : currentVariant;
+                            //cfg[variant.variantMember] = currentVariant === '*' ? 1 : currentVariant;
                             rpcProcessors['db'](cfg, 'processor');
                         })
                         variantDiv.append(execute)

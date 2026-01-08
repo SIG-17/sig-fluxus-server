@@ -23,7 +23,5 @@ interface ProtocolManagerInterface
     public function runOnOpenConnection(Server $server, Request $request): void;
     public function runOnCloseConnection(Server $server, int $fd): void;
     public function cleanUpResources();
-    public function registerRpcMethods(MethodsCollection $collection): void;
-    public function registerRpcMethod(MethodConfig $method): bool;
 
 }
