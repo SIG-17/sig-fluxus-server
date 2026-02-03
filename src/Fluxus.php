@@ -444,7 +444,7 @@ class Fluxus extends Server
         $this->runEventActions('start', [], 'before');
         $started = parent::start();
         $this->logger?->info('Servidor iniciado');
-        $this->runEventActions('start', [], 'after');
+       // $this->runEventActions('start', [], 'after'); // esto corre en el método initializeServices() que esta programado para hacerlo en el evento 'start'
         return $started;
     }
 
