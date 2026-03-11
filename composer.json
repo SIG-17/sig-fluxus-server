@@ -18,6 +18,10 @@
     {
       "type": "composer",
       "url": "https://tabula17.repo.repman.io"
+    },
+    {
+      "type": "vcs",
+      "url": "git@github.com:Martin17/mongo.git"
     }
   ],
   "minimum-stability": "dev",
